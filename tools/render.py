@@ -233,7 +233,7 @@ class _PanelArtists:
         )
 
 
-def render_to_gif(frames, output_path, config, fps=20, every=1, n_panels=4):
+def render_to_gif(frames, output_path, config, fps=10, every=1, n_panels=4):
     """Draw recorded frames as a 2x2 grid and write an animated GIF.
 
     `every` skips frames at DRAW time, not record time -- so you can render

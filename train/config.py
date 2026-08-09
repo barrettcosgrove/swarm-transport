@@ -31,7 +31,7 @@ class Config:
 
     # physics constants
     body_stiffness: float = 100.0
-    wall_stiffness: float = 200.0
+    wall_stiffness: float = 2000.0
     obstacle_stiffness: float = 100.0
     payload_stiffness: float = 150.0
     agent_drag_coef: float = 0.25
