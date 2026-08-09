@@ -1,0 +1,13 @@
+# Python virtualenv
+.venv/
+
+# Python bytecode / caches
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Node
+node_modules/
+
+# Training artifacts (the exported web/model/actor.onnx is intentionally tracked)
+train/checkpoints/
