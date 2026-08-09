@@ -7,8 +7,8 @@ class Config:
     device: str = "cpu"
     num_envs: int = 64
     n_agents: int = 3
-    max_steps: int = 250
-    dt: float = 0.1
+    max_steps: int = 500
+    dt: float = 0.05
 
     # sizes and masses
     agent_radius: float = 0.1
@@ -30,17 +30,17 @@ class Config:
     obstacle_active: torch.Tensor = torch.zeros(1, dtype=torch.bool)
 
     # physics constants
-    body_stiffness: float = 100.0
-    wall_stiffness: float = 2000.0
-    obstacle_stiffness: float = 100.0
-    payload_stiffness: float = 150.0
+    body_stiffness: float = 200.0
+    wall_stiffness: float = 1200.0
+    obstacle_stiffness: float = 200.0
+    payload_stiffness: float = 250.0
     agent_drag_coef: float = 0.25
     predator_drag_coef: float = 0.25
     payload_drag_coef: float = 0.1
     agent_max_thrust: float = 5.0
     predator_max_speed: float = 3.5
     predator_max_thrust: float = 3.5
-    predator_stiffness: float = 100.0
+    predator_stiffness: float = 200.0
     predator_cooldown_duration: float = 10.0
     predator_cooldown_speed_factor: float = 0.5
     predator_weight: float = 1.0       # w in the guard formula
@@ -58,7 +58,7 @@ class Config:
     # rewards
     progress_coef: float = 10.0
     time_penalty_coef: float = 0.3
-    success_threshold: float = 0.2
+    success_threshold: float = 0.3
     success_reward: float = 100.0
     proximity_coef_start: float = 5.0
     proximity_anneal_fraction: float = 0.3

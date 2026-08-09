@@ -66,6 +66,10 @@ class Frame:
     step_count: torch.Tensor       # (E,)
     took_damage: torch.Tensor      # (E,) bool -- health dropped this step
     at_goal: torch.Tensor          # (E,) bool -- payload within success radius
+    terminated: torch.Tensor       # (E,) bool -- success or capture, this step
+    truncated: torch.Tensor        # (E,) bool -- hit max_steps, this step
+    win_count: torch.Tensor        # (E,) running total, carried forward every frame
+    loss_count: torch.Tensor       # (E,) running total, carried forward every frame
 
 
 def record_episode(env, policy, n_steps, training_progress=1.0):
@@ -73,19 +77,33 @@ def record_episode(env, policy, n_steps, training_progress=1.0):
 
     `policy` is any callable (world_state, scenario_state, config) -> actions,
     so this works identically for the scripted controller and a trained actor.
+
+    Win/loss are classified from terminated/truncated + at_goal:
+      terminated & at_goal   -> win (success)
+      terminated & ~at_goal  -> loss (captured)
+      truncated & ~terminated -> loss (timeout)
     """
     frames = []
     env.reset()
+    E = env.config.num_envs
+    win_count = torch.zeros(E)
+    loss_count = torch.zeros(E)
+    min_payload_dist = torch.full((E,), float("inf"))
 
     for _ in range(n_steps):
         ws, ss = env.world_state, env.scenario_state
         actions = policy(ws, ss, env.config)
 
         health_before = ss.health.clone()
-        env.step(actions, training_progress)
-        ws, ss = env.world_state, env.scenario_state
+        obs, reward, terminated, truncated, info = env.step(actions, training_progress)
+        ws, ss = info["world_state"], info["scenario_state"]
 
-        payload_dist = torch.norm(ws.payload_pos - ss.goal_pos, dim=-1)
+        payload_dist = info["payload_dist"]
+        min_payload_dist = torch.minimum(min_payload_dist, payload_dist)
+        at_goal = info["success"]
+
+        win_count = win_count + (terminated & at_goal).float()
+        loss_count = loss_count + (terminated & ~at_goal).float() + (truncated & ~terminated).float()
 
         frames.append(Frame(
             agent_pos=ws.agent_pos.clone(),
@@ -97,8 +115,16 @@ def record_episode(env, policy, n_steps, training_progress=1.0):
             health=ss.health.clone(),
             step_count=ss.step_count.clone(),
             took_damage=(ss.health < health_before),
-            at_goal=(payload_dist < env.config.success_threshold),
+            at_goal=at_goal,
+            terminated=terminated.clone(),
+            truncated=truncated.clone(),
+            win_count=win_count.clone(),
+            loss_count=loss_count.clone(),
         ))
+    
+    print(f"closest approach per env (threshold={env.config.success_threshold}):")
+    for e in range(E):
+        print(f"  env {e}: {min_payload_dist[e].item():.3f}")
 
     return frames
 
@@ -106,10 +132,16 @@ def record_episode(env, policy, n_steps, training_progress=1.0):
 # ---------------------------------------------------------------- drawing
 
 def compute_arena_limit(config, margin=1.15):
+    """
+    View bounds derived from the walls themselves, rather than a separate
+    hardcoded constant that could drift out of sync with the actual arena
+    size as it gets tuned during Phase 2 calibration.
+    """
     max_extent = 0.0
     for center, halfsize in zip(config.wall_center, config.wall_halfsize):
         max_extent = max(max_extent, abs(center[0]) + halfsize[0], abs(center[1]) + halfsize[1])
     return max_extent * margin
+
 
 class _PanelArtists:
     """Holds the matplotlib patch objects for one panel.
@@ -173,6 +205,22 @@ class _PanelArtists:
         self.text = ax.text(0.02, 0.98, "", transform=ax.transAxes,
                              va="top", ha="left", fontsize=7, family="monospace")
 
+        # persistent tally, always visible, separate from the transient outcome banner
+        self.tally = ax.text(0.02, 0.02, "", transform=ax.transAxes,
+                              va="bottom", ha="left", fontsize=8, family="monospace",
+                              weight="bold")
+
+        # outcome banner -- hidden by default, shown only on the frame(s) an
+        # episode ends. Covers most of the panel so it's impossible to miss
+        # even while skimming a fast-moving grid.
+        self.banner_bg = Rectangle((0.1, 0.4), 0.8, 0.2, transform=ax.transAxes,
+                                     facecolor="white", edgecolor="black", linewidth=1.5,
+                                     alpha=0.9, zorder=20, visible=False)
+        ax.add_patch(self.banner_bg)
+        self.banner_text = ax.text(0.5, 0.5, "", transform=ax.transAxes,
+                                     va="center", ha="center", fontsize=16, weight="bold",
+                                     zorder=21, visible=False)
+
         # health bar: a grey background track with a colored fill on top.
         # transform=ax.transAxes puts these in panel-relative coordinates
         # (0-1) rather than world coordinates, so they stay pinned to the
@@ -232,13 +280,68 @@ class _PanelArtists:
             COLOR_HEALTH_LOW if frac < 0.3 else COLOR_HEALTH_OK
         )
 
+        wins = int(frame.win_count[e])
+        losses = int(frame.loss_count[e])
+        self.tally.set_text(f"W {wins}  L {losses}")
 
-def render_to_gif(frames, output_path, config, fps=10, every=1, n_panels=4):
+        # outcome banner: only visible on the exact frame(s) an episode ended.
+        # Since render_to_gif redraws this SAME frame repeatedly during a
+        # hold, the banner naturally persists for the hold's duration with
+        # no separate timer needed here.
+        won = bool(frame.terminated[e] and frame.at_goal[e])
+        captured = bool(frame.terminated[e] and not frame.at_goal[e])
+        timed_out = bool(frame.truncated[e] and not frame.terminated[e])
+
+        if won or captured or timed_out:
+            self.banner_bg.set_visible(True)
+            self.banner_text.set_visible(True)
+            if won:
+                self.banner_bg.set_facecolor("#d4f7d4")
+                self.banner_text.set_text("WIN")
+                self.banner_text.set_color(COLOR_PAYLOAD_SUCCESS)
+            elif captured:
+                self.banner_bg.set_facecolor("#fadada")
+                self.banner_text.set_text("CAPTURED")
+                self.banner_text.set_color(COLOR_PREDATOR)
+            else:
+                self.banner_bg.set_facecolor("#f0f0f0")
+                self.banner_text.set_text("TIMEOUT")
+                self.banner_text.set_color("#555555")
+        else:
+            self.banner_bg.set_visible(False)
+            self.banner_text.set_visible(False)
+
+
+def _build_panel_schedule(frames, panel_idx, every, hold_frames):
+    """
+    Build the sequence of recorded-frame indices to draw for ONE panel,
+    inserting `hold_frames` repeats every time that panel's episode ends.
+
+    This runs independently per panel -- panel 0 finishing on step 3 while
+    panel 1 is still mid-episode on step 50 means panel 0 holds while panel
+    1 keeps advancing normally. This is deliberate: freezing the whole grid
+    whenever any single panel finishes would defeat the point of watching
+    four independent episodes side by side.
+    """
+    schedule = []
+    for i in range(0, len(frames), every):
+        schedule.append(i)
+        ended = bool(frames[i].terminated[panel_idx] or frames[i].truncated[panel_idx])
+        if ended:
+            schedule.extend([i] * hold_frames)
+    return schedule
+
+
+def render_to_gif(frames, output_path, config, fps=20, every=1, n_panels=4, hold_seconds=1.5):
     """Draw recorded frames as a 2x2 grid and write an animated GIF.
 
     `every` skips frames at DRAW time, not record time -- so you can render
     a quick low-frame-count version and a detailed one from the same
     recording without re-running the simulation.
+
+    `hold_seconds` controls how long each panel pauses on its outcome banner
+    once an episode ends -- converted to a frame count using `fps`, since a
+    GIF has no independent notion of "pause," only "show this frame longer."
     """
     if not frames:
         raise ValueError("no frames to render")
@@ -247,6 +350,7 @@ def render_to_gif(frames, output_path, config, fps=10, every=1, n_panels=4):
     n_panels = min(n_panels, E)
     n_agents = frames[0].agent_pos.shape[1]
     n_obstacles = frames[0].obstacle_center.shape[1]
+    hold_frames = int(round(hold_seconds * fps))
 
     fig, axes = plt.subplots(2, 2, figsize=(8, 8), dpi=80)
     axes = axes.flatten()
@@ -257,10 +361,19 @@ def render_to_gif(frames, output_path, config, fps=10, every=1, n_panels=4):
                for e in range(n_panels)]
     fig.tight_layout()
 
+    # one schedule per panel, since panels can hold at different points and
+    # for different total durations depending on when each one's episodes end
+    schedules = [_build_panel_schedule(frames, e, every, hold_frames) for e in range(n_panels)]
+    max_len = max(len(s) for s in schedules)
+    for s in schedules:
+        if len(s) < max_len:
+            s.extend([s[-1]] * (max_len - len(s)))   # pad shorter panels by holding their last frame
+
     images = []
-    for i in range(0, len(frames), every):
+    for out_i in range(max_len):
         for e in range(n_panels):
-            artists[e].update(frames[i], e, config)
+            frame_idx = schedules[e][out_i]
+            artists[e].update(frames[frame_idx], e, config)
         fig.canvas.draw()
         # buffer_rgba() is the current API -- tostring_rgb() was removed in
         # recent matplotlib. The .copy() matters: the buffer is reused each
@@ -285,5 +398,5 @@ if __name__ == "__main__":
     config = Config(num_envs=4)
     env = Env(config)
     frames = record_episode(env, scripted_policy, n_steps=config.max_steps)
-    path = render_to_gif(frames, "outputs/scripted_rollout.gif", config, fps=20, every=2)
+    path = render_to_gif(frames, "outputs/scripted_rollout.gif", config, fps=8, every=2, hold_seconds=1.5)
     print(f"wrote {path}")

@@ -38,12 +38,23 @@ class Env:
         terminated, truncated = scenario.compute_done(self.world_state, self.scenario_state, self.config)
         needs_reset = terminated | truncated
         observation = scenario.observe(self.world_state, self.scenario_state, self.config)
+        
+        payload_dist = torch.norm(self.world_state.payload_pos - self.scenario_state.goal_pos, dim=-1)
+        info = {
+            "payload_dist": payload_dist,
+            "success": payload_dist < self.config.success_threshold,
+            "captured": self.scenario_state.health <= 0.0,
+            "world_state": self.world_state,
+            "scenario_state": self.scenario_state,
+        }
+        
+        
         self.world_state, self.scenario_state = scenario.reset_at(self.world_state, self.scenario_state, needs_reset, self.config, self.generator)
         
         current_payload_dist = torch.norm(self.world_state.payload_pos - self.scenario_state.goal_pos , dim=-1)
         self.scenario_state = dataclasses.replace(self.scenario_state, step_count=self.scenario_state.step_count + 1, prev_payload_dist=current_payload_dist)
         
-        return observation, reward, terminated, truncated
+        return observation, reward, terminated, truncated, info
     
     def reset(self):
         self.world_state, self.scenario_state = scenario.reset(self.config.num_envs, self.config, self.generator)
