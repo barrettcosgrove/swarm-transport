@@ -2,9 +2,14 @@ import torch
 import dataclasses
 import torch.nn.functional as F
 
-def integrate(pos, vel, force, mass, dt):
+def integrate(pos, vel, force, mass, dt, max_speed=None):
     acceleration = force / mass
     new_vel = vel + acceleration * dt
+    if max_speed is not None:
+        # clamped before the position update, or the body would travel a step
+        # at a speed it is not allowed to have
+        speed = torch.norm(new_vel, dim=-1, keepdim=True)
+        new_vel = new_vel * torch.clamp(max_speed / speed.clamp(min=1e-6), max=1.0)
     new_pos = pos + new_vel * dt
     return new_pos, new_vel
 
@@ -103,7 +108,7 @@ def box_box_forces(payload_center, payload_halfsize, box_center, box_halfsize, s
     force = force_magnitude * direction
     return force.sum(dim=1)
 
-def step(world_state, agent_actions, predator_actions, dt, agent_max_thrust, predator_max_thrust, agent_drag_coef, predator_drag_coef, payload_drag_coef, body_stiffness,wall_stiffness, obstacle_stiffness, payload_stiffness):
+def step(world_state, agent_actions, predator_actions, dt, agent_max_thrust, predator_max_thrust, agent_drag_coef, predator_drag_coef, payload_drag_coef, body_stiffness,wall_stiffness, obstacle_stiffness, payload_stiffness, predator_max_speed=None):
     agent_thrust = agent_actions * agent_max_thrust
     agent_drag = -agent_drag_coef * world_state.agent_vel
     
@@ -148,7 +153,7 @@ def step(world_state, agent_actions, predator_actions, dt, agent_max_thrust, pre
     payload_total_force = payload_drag + force_payload_from_agent + force_payload_from_predator + force_payload_wall + force_payload_obstacle
     
     new_agent_pos, new_agent_vel = integrate(world_state.agent_pos, world_state.agent_vel, agent_total_force, world_state.agent_mass, dt)
-    new_predator_pos, new_predator_vel = integrate(world_state.predator_pos, world_state.predator_vel, predator_total_force, world_state.predator_mass, dt)
+    new_predator_pos, new_predator_vel = integrate(world_state.predator_pos, world_state.predator_vel, predator_total_force, world_state.predator_mass, dt, max_speed=predator_max_speed)
     new_payload_pos, new_payload_vel = integrate(world_state.payload_pos, world_state.payload_vel, payload_total_force, world_state.payload_mass, dt)
     
     new_world_state = dataclasses.replace(world_state, agent_pos=new_agent_pos, agent_vel=new_agent_vel, predator_pos=new_predator_pos, predator_vel=new_predator_vel, payload_pos=new_payload_pos, payload_vel=new_payload_vel)

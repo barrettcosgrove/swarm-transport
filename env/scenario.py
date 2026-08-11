@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 import torch
 from .world import WorldState
-from .physics import circle_box_static_forces, circle_circle_forces
+from .physics import circle_box_static_forces
 import math 
 import dataclasses
 
@@ -14,6 +14,8 @@ class ScenarioState:
     predator_cooldown: torch.Tensor   # (E,)
     prev_payload_dist: torch.Tensor   # (E,)
     predator_noise: torch.Tensor      # (E, 2)
+    predator_target: torch.Tensor     # (E,) long -- agent the predator is committed to
+    predator_retarget_timer: torch.Tensor  # (E,) steps left before it may reconsider
     
     
 def reset(num_envs, config, generator) -> (WorldState, ScenarioState):
@@ -65,6 +67,9 @@ def reset(num_envs, config, generator) -> (WorldState, ScenarioState):
         predator_cooldown=torch.zeros(E, device=dev),
         prev_payload_dist=torch.norm(payload_pos - goal_pos, dim=-1),
         predator_noise=torch.zeros(E, 2, device=dev),
+        # timer at zero so the first step picks a target normally
+        predator_target=torch.zeros(E, dtype=torch.long, device=dev),
+        predator_retarget_timer=torch.zeros(E, device=dev),
     )
     return world_state, scenario_state
 
@@ -94,6 +99,8 @@ def reset_at(world_state, scenario_state, needs_reset, config, generator) -> tup
         prev_payload_dist=torch.where(mask1, fresh_scenario.prev_payload_dist, scenario_state.prev_payload_dist),
         prev_health=torch.where(mask1, fresh_scenario.prev_health, scenario_state.prev_health),
         predator_noise=torch.where(mask2, fresh_scenario.predator_noise, scenario_state.predator_noise),
+        predator_target=torch.where(mask1, fresh_scenario.predator_target, scenario_state.predator_target),
+        predator_retarget_timer=torch.where(mask1, fresh_scenario.predator_retarget_timer, scenario_state.predator_retarget_timer),
     )
 
     return new_world, new_scenario
@@ -172,50 +179,95 @@ def compute_done(world_state, scenario_state, config) -> tuple[torch.Tensor, tor
     
     return terminated, truncated
 
-def predator_policy(world_state, scenario_state, config) -> (torch.Tensor, ScenarioState):  # (E, 2)   [Version 2]
+def predator_policy(world_state, scenario_state, config, generator=None) -> (torch.Tensor, ScenarioState):  # (E, 2)   [Version 2]
     E = world_state.agent_pos.shape[0]
     
     dist_agent_to_predator = torch.norm(world_state.agent_pos - world_state.predator_pos.unsqueeze(1), dim=-1)
     dist_agent_to_payload = torch.norm(world_state.agent_pos - world_state.payload_pos.unsqueeze(1), dim=-1)
     score = dist_agent_to_predator + config.predator_weight * dist_agent_to_payload
     
-    target = torch.argmin(score, dim=-1)
+    # Commit to a target for a while instead of re-deciding every step. Pure
+    # per-step argmin switched targets ~73 times an episode, because the moment
+    # an agent flees it stops being the nearest and the predator turns on
+    # whoever stayed to push. That makes evading impossible by construction,
+    # and it makes the predator's behaviour high-frequency noise for a policy
+    # trying to learn against it.
+    timer = scenario_state.predator_retarget_timer
+    retarget = timer <= 0.0
+    target = torch.where(retarget, torch.argmin(score, dim=-1), scenario_state.predator_target)
+    new_timer = torch.where(retarget,
+                            torch.full_like(timer, config.predator_target_commit_steps),
+                            torch.clamp(timer - 1.0, min=0.0))
+    
     target_pos = world_state.agent_pos[torch.arange(E), target]
     pred_pos = world_state.predator_pos
     
     to_target = target_pos - pred_pos
     direction = to_target / torch.norm(to_target, dim=-1, keepdim=True).clamp(min=1e-6)
     
-    new_noise = (config.ou_decay * scenario_state.predator_noise) + (torch.randn_like(scenario_state.predator_noise) * config.ou_sigma)
+    # randn with the env's generator, not randn_like: randn_like draws from the
+    # global RNG, which left rollouts irreproducible even under a fixed seed
+    noise_sample = torch.randn(scenario_state.predator_noise.shape, generator=generator,
+                               device=scenario_state.predator_noise.device,
+                               dtype=scenario_state.predator_noise.dtype)
+    new_noise = (config.ou_decay * scenario_state.predator_noise) + (noise_sample * config.ou_sigma)
     noisy_direction = direction + new_noise
     noisy_direction = noisy_direction / torch.norm(noisy_direction, dim=-1, keepdim=True).clamp(min=1e-6)
     
-    throttle = torch.where(scenario_state.predator_cooldown > 0.0,
-                           torch.full_like(scenario_state.predator_cooldown, config.predator_cooldown_speed_factor),
-                           torch.ones_like(scenario_state.predator_cooldown))
-    action = throttle.unsqueeze(1) * noisy_direction
+    # cooldown slows the predator by capping its speed, not its thrust -- see
+    # effective_predator_max_speed, applied in env.step
+    action = noisy_direction
     
-    new_scenario_state = dataclasses.replace(scenario_state, predator_noise=new_noise)
+    new_scenario_state = dataclasses.replace(scenario_state, predator_noise=new_noise,
+                                             predator_target=target,
+                                             predator_retarget_timer=new_timer)
     
     return action, new_scenario_state
 
+
+def effective_predator_max_speed(scenario_state, config) -> torch.Tensor:   # (E, 1)
+    """The predator's speed cap this step, halved while it is cooling down.
+
+    DESIGN.md expresses the cooldown as a speed cap rather than a thrust cut so
+    that a cooling predator still turns as sharply, it just cannot close as
+    fast. Shaped (E, 1) to broadcast against predator_vel in physics.integrate.
+    """
+    cooldown = scenario_state.predator_cooldown
+    capped = torch.where(
+        cooldown > 0.0,
+        torch.full_like(cooldown, config.predator_max_speed * config.predator_cooldown_speed_factor),
+        torch.full_like(cooldown, config.predator_max_speed),
+    )
+    return capped.unsqueeze(-1)
+
 def update_health(world_state, scenario_state, config) -> ScenarioState: 
-    E = world_state.agent_pos.shape[0]
+    """Drain a flat health_loss_per_step whenever any agent is inside the
+    predator's capture radius, per DESIGN.md section 7.
+
+    Deliberately not proportional to contact force. Penalty forces scale with
+    penetration depth, and penetration depth is set by how far a body travels
+    in one dt -- agents cover 1.0 units per step against a 0.25 contact
+    distance, so a force-scaled drain made a single touch cost anywhere from 1
+    to 100 health depending on the approach angle. Scaling that down moves the
+    whole distribution but leaves the spread alone; the p95 stayed at roughly
+    3x the median at every scale tested. A flat rate makes health a legible
+    budget: max_health / health_loss_per_step contacts, whatever the geometry.
+
+    Capture radius is its own constant rather than the sum of body radii, so
+    "close enough to be hurt" can be tuned without resizing the bodies.
+    """
+    dist_to_predator = torch.norm(world_state.agent_pos - world_state.predator_pos.unsqueeze(1), dim=-1)
     
-    agent_pos = world_state.agent_pos
-    agent_radius = world_state.agent_radius
-    predator_pos = world_state.predator_pos
-    predator_radius = world_state.predator_radius
-    
-    force_on_agents, _ = circle_circle_forces(agent_pos, agent_radius, predator_pos, predator_radius, config.predator_stiffness)
-    contact_magnitude = torch.norm(force_on_agents, dim=-1)
-    total_contact_magnitude = contact_magnitude.sum(dim=-1)
+    # any(), not sum(): the health pool is shared, so a second agent in range
+    # is already caught by the first one's drain
+    in_capture = (dist_to_predator < config.predator_capture_radius).any(dim=-1)
     
     no_cooldown = scenario_state.predator_cooldown <= 0.0
-    in_contact = total_contact_magnitude > 0.0
-    deal_damage = no_cooldown & in_contact
+    deal_damage = no_cooldown & in_capture
     
-    damage = torch.where(deal_damage, config.health_loss_per_step * total_contact_magnitude, torch.zeros_like(scenario_state.health))
+    damage = torch.where(deal_damage,
+                         torch.full_like(scenario_state.health, config.health_loss_per_step),
+                         torch.zeros_like(scenario_state.health))
     new_health = torch.clamp(scenario_state.health - damage, min=0.0)
     
     new_predator_cooldown = torch.where(deal_damage, torch.full_like(scenario_state.predator_cooldown, config.predator_cooldown_duration), torch.clamp(scenario_state.predator_cooldown - 1, min=0.0))

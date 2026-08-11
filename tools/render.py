@@ -202,6 +202,13 @@ class _PanelArtists:
                                 facecolor=COLOR_PREDATOR, edgecolor="none", zorder=5)
         ax.add_patch(self.predator)
 
+        # capture radius is larger than the body and is what actually drains
+        # health, so without drawing it the damage looks like it fires at range
+        self.capture = Circle((0, 0), config.predator_capture_radius, facecolor="none",
+                               edgecolor=COLOR_PREDATOR, linestyle=":", linewidth=1,
+                               alpha=0.6, zorder=4)
+        ax.add_patch(self.capture)
+
         self.text = ax.text(0.02, 0.98, "", transform=ax.transAxes,
                              va="top", ha="left", fontsize=7, family="monospace")
 
@@ -261,6 +268,7 @@ class _PanelArtists:
 
         rx, ry = frame.predator_pos[e]
         self.predator.center = (float(rx), float(ry))
+        self.capture.center = (float(rx), float(ry))
 
         health = float(frame.health[e])
         max_health = config.max_health

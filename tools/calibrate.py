@@ -8,21 +8,41 @@ constants, and recommends max_steps so solo single-agent traversal consumes
 Run this any time dt, stiffness, mass, or thrust change -- the "right"
 max_steps depends on the whole chain of constants, not dt alone.
 """
+import dataclasses
+
 import torch
 import env.scenario as scenario
 import env.physics as physics
 
 
 def measure_cruising_speed(config, warmup_steps=50, measure_steps=100, seed=0):
+    # One agent, placed by hand rather than sampled. The spawn annulus is sized
+    # against the arena, so a randomly placed agent can easily start far enough
+    # from the payload that it never makes contact and this reads zero.
+    config = dataclasses.replace(config, n_agents=1)
     generator = torch.Generator().manual_seed(seed)
     world_state, scenario_state = scenario.reset(1, config, generator)
 
     goal_dir = scenario_state.goal_pos - world_state.payload_pos
     goal_dir = goal_dir / torch.norm(goal_dir, dim=-1, keepdim=True)
 
-    agent_action = torch.zeros(1, config.n_agents, 2)
-    agent_action[:, 0] = goal_dir       # only agent 0 pushes, straight toward the goal
-    predator_action = torch.zeros(1, 2)  # predator held still -- keep the measurement clean
+    # agent against the payload's trailing face, already in contact
+    standoff = float(config.payload_halfsize.max()) + config.agent_radius
+    agent_pos = (world_state.payload_pos - goal_dir * standoff).unsqueeze(1)
+
+    # predator moved off to the side. It spawns on the payload->goal ray, so
+    # left alone this measures the speed of shoving a payload and a predator.
+    perp = torch.stack([-goal_dir[:, 1], goal_dir[:, 0]], dim=-1)
+    predator_pos = world_state.payload_pos + perp * config.goal_radius
+
+    world_state = dataclasses.replace(
+        world_state,
+        agent_pos=agent_pos, agent_vel=torch.zeros_like(agent_pos),
+        predator_pos=predator_pos, predator_vel=torch.zeros_like(predator_pos),
+    )
+
+    agent_action = goal_dir.unsqueeze(1)  # sustained max effort, straight at the goal
+    predator_action = torch.zeros(1, 2)   # predator held still -- keep the measurement clean
 
     def do_step(ws):
         return physics.step(
@@ -30,6 +50,7 @@ def measure_cruising_speed(config, warmup_steps=50, measure_steps=100, seed=0):
             config.agent_max_thrust, config.predator_max_thrust,
             config.agent_drag_coef, config.predator_drag_coef, config.payload_drag_coef,
             config.body_stiffness, config.wall_stiffness, config.obstacle_stiffness, config.payload_stiffness,
+            config.predator_max_speed,
         )
 
     for _ in range(warmup_steps):        # let thrust/drag reach equilibrium before measuring

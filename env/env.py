@@ -14,7 +14,9 @@ import dataclasses
 4. scenario.compute_reward()  -> reward tensor
 5. scenario.compute_done()    -> terminated, truncated
 6. scenario.observe()         -> observation tensor
-7. dataclasses.replace on scenario_state to advance step_count and prev_payload_dist
+7. build the info dict from the pre-reset state
+8. scenario.reset_at()        -> respawn the environments that finished
+9. dataclasses.replace on scenario_state to advance step_count and prev_payload_dist
 """
 
 class Env:
@@ -29,9 +31,10 @@ class Env:
         self.total_steps += self.config.num_envs
         if training_progress is None:
             training_progress = min(self.total_steps / (self.config.num_iterations * self.config.rollout_steps * self.config.num_envs), 1.0)
-        predator_action, self.scenario_state = scenario.predator_policy(self.world_state, self.scenario_state, self.config)
+        predator_action, self.scenario_state = scenario.predator_policy(self.world_state, self.scenario_state, self.config, self.generator)
         
-        self.world_state = physics.step(self.world_state, agent_action, predator_action, self.config.dt, self.config.agent_max_thrust, self.config.predator_max_thrust, self.config.agent_drag_coef, self.config.predator_drag_coef, self.config.payload_drag_coef, self.config.body_stiffness, self.config.wall_stiffness, self.config.obstacle_stiffness, self.config.payload_stiffness)
+        predator_max_speed = scenario.effective_predator_max_speed(self.scenario_state, self.config)
+        self.world_state = physics.step(self.world_state, agent_action, predator_action, self.config.dt, self.config.agent_max_thrust, self.config.predator_max_thrust, self.config.agent_drag_coef, self.config.predator_drag_coef, self.config.payload_drag_coef, self.config.body_stiffness, self.config.wall_stiffness, self.config.obstacle_stiffness, self.config.payload_stiffness, predator_max_speed)
         self.scenario_state = scenario.update_health(self.world_state, self.scenario_state, self.config)
         
         reward = scenario.compute_reward(self.world_state, self.scenario_state, training_progress, self.config)

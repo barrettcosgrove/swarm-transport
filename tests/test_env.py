@@ -54,7 +54,7 @@ def test_step_produces_correct_shapes():
     env.reset()
 
     actions = torch.rand(config.num_envs, config.n_agents, 2) * 2 - 1
-    obs, reward, terminated, truncated = env.step(actions, training_progress=0.0)
+    obs, reward, terminated, truncated, info = env.step(actions, training_progress=0.0)
 
     assert obs.shape == (config.num_envs, config.n_agents, config.obs_dim)
     assert reward.shape == (config.num_envs, config.n_agents)
@@ -65,6 +65,29 @@ def test_step_produces_correct_shapes():
 
     assert_finite(obs, "step observation")
     assert_finite(reward, "step reward")
+
+
+def test_step_info_contents():
+    """The info dict is what the renderer and any logging read, so pin its
+    keys, shapes, and the one relationship that holds between them."""
+    config = make_test_config()
+    env = Env(config)
+    env.reset()
+
+    actions = torch.rand(config.num_envs, config.n_agents, 2) * 2 - 1
+    _, _, _, _, info = env.step(actions, training_progress=0.0)
+
+    for key in ("payload_dist", "success", "captured", "world_state", "scenario_state"):
+        assert key in info, f"info is missing {key}"
+
+    for key in ("payload_dist", "success", "captured"):
+        assert info[key].shape == (config.num_envs,), f"info[{key}] has the wrong shape"
+
+    assert_finite(info["payload_dist"], "info payload_dist")
+    assert torch.equal(info["success"], info["payload_dist"] < config.success_threshold)
+
+    assert isinstance(info["world_state"], WorldState)
+    assert isinstance(info["scenario_state"], scenario.ScenarioState)
 
 
 def test_truncation_fires_at_max_steps():
@@ -78,7 +101,7 @@ def test_truncation_fires_at_max_steps():
     actions = torch.zeros(config.num_envs, config.n_agents, 2)   # no thrust, just wait it out
     truncated_any = torch.zeros(config.num_envs, dtype=torch.bool)
     for _ in range(config.max_steps + 1):
-        _, _, terminated, truncated = env.step(actions, training_progress=0.0)
+        _, _, terminated, truncated, _ = env.step(actions, training_progress=0.0)
         truncated_any |= truncated
 
     assert truncated_any.all(), "expected every environment to truncate within max_steps + 1 calls"
@@ -174,7 +197,7 @@ def test_long_rollout_never_produces_nan():
     for step_idx in range(300):
         actions = torch.rand(config.num_envs, config.n_agents, 2) * 2 - 1
         training_progress = step_idx / 300
-        obs, reward, terminated, truncated = env.step(actions, training_progress)
+        obs, reward, terminated, truncated, _ = env.step(actions, training_progress)
 
         assert_finite(obs, f"observation at step {step_idx}")
         assert_finite(reward, f"reward at step {step_idx}")
