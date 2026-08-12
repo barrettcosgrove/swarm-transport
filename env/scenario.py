@@ -18,6 +18,53 @@ class ScenarioState:
     predator_retarget_timer: torch.Tensor  # (E,) steps left before it may reconsider
     
     
+def _sample_obstacle_centers(payload_pos, theta, config, generator) -> torch.Tensor:   # (E, n_obstacles, 2)
+    """Obstacle centers for one batch of resets, valid by construction.
+
+    Polar, like every other spawn: an angular sector drawn from the arc left
+    over once the predator/goal corridor is excluded, and a radius uniform in
+    the band. train/config.py carries the derivation of each bound; the short
+    version is that band_min clears the agent annulus, band_max clears the
+    goal, the corridor wedge clears the predator, and the minimum angular gap
+    clears the other obstacles.
+
+    Sectors are drawn without replacement rather than one obstacle per fixed
+    quadrant, so layouts differ between episodes instead of being the same
+    cross at a different rotation. Leaving a sector empty only ever widens a
+    gap, so it cannot break the clearance guarantee.
+
+    No rejection loop: every sample is legal the first time. A retry would
+    have to be per-environment, which is exactly the thing a batched reset
+    cannot do cheaply.
+    """
+    E = payload_pos.shape[0]
+    dev = config.device
+    n_obstacles = config.n_obstacles
+
+    arc = 2 * math.pi - 2 * config.obstacle_corridor_half_angle
+    sector_width = arc / config.obstacle_n_sectors
+    # room to jitter inside a sector while still keeping the gap to the next
+    # one. Negative means the sector count and the gap disagree, and every
+    # clearance downstream is void.
+    jitter_range = sector_width - config.obstacle_min_angular_gap
+    assert jitter_range >= 0.0, \
+        "obstacle_n_sectors too high to hold obstacle_min_angular_gap"
+
+    # argsort of uniform keys is a random permutation per env, so the first
+    # n_obstacles entries are distinct sectors
+    sector = torch.rand(E, config.obstacle_n_sectors, generator=generator, device=dev) \
+             .argsort(dim=-1)[:, :n_obstacles]
+    within_sector = torch.rand(E, n_obstacles, generator=generator, device=dev) * jitter_range
+
+    angle = theta.unsqueeze(1) + config.obstacle_corridor_half_angle \
+            + sector * sector_width + within_sector
+    radius = config.obstacle_band_min + torch.rand(E, n_obstacles, generator=generator, device=dev) \
+             * (config.obstacle_band_max - config.obstacle_band_min)
+
+    offset = torch.stack([radius * torch.cos(angle), radius * torch.sin(angle)], dim=-1)
+    return payload_pos.unsqueeze(1) + offset
+
+
 def reset(num_envs, config, generator) -> (WorldState, ScenarioState):
     E = num_envs
     dev = config.device
@@ -45,6 +92,10 @@ def reset(num_envs, config, generator) -> (WorldState, ScenarioState):
     goal_pos = payload_pos + config.goal_radius \
                * torch.stack([torch.cos(goal_theta), torch.sin(goal_theta)], dim=-1)
 
+    # 5. obstacles — a ring between the agent annulus and the goal, placed
+    # last so they can be kept clear of everything already on the board
+    obstacle_center = _sample_obstacle_centers(payload_pos, theta, config, generator)
+
     world_state = WorldState(
         agent_pos=agent_pos, agent_vel=torch.zeros_like(agent_pos),
         predator_pos=predator_pos, predator_vel=torch.zeros_like(predator_pos),
@@ -54,7 +105,7 @@ def reset(num_envs, config, generator) -> (WorldState, ScenarioState):
         payload_halfsize=config.payload_halfsize, payload_mass=config.payload_mass,
         wall_center=config.wall_center, wall_halfsize=config.wall_halfsize,
         # obstacles carry a per-env axis so reset_at can swap them per environment
-        obstacle_center=config.obstacle_center.expand(E, -1, -1),
+        obstacle_center=obstacle_center,
         obstacle_halfsize=config.obstacle_halfsize,
         obstacle_active=config.obstacle_active.expand(E, -1),
     )

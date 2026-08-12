@@ -180,6 +180,144 @@ def test_reset_at_no_environments_flagged_changes_nothing():
     assert torch.equal(new_scenario.step_count, scenario_state.step_count)
 
 
+# ---------------------------------------------------------------- obstacle spawn invariants
+
+SPAWN_SEEDS = (0, 1, 2)
+
+
+def point_box_distance(points, box_center, box_halfsize):
+    """(E, P, B) exterior distance from each point to each box, 0 when inside.
+
+    Exact for axis-aligned boxes, where the spawn constants are derived from
+    a box's circumradius. Checking against the exact distance means these
+    assertions fail on a real overlap rather than on the conservative bound
+    happening to be tight.
+    """
+    delta = (points.unsqueeze(2) - box_center.unsqueeze(1)).abs()          # (E, P, B, 2)
+    return torch.norm(torch.clamp(delta - box_halfsize, min=0.0), dim=-1)
+
+
+def box_box_gap(center_a, halfsize_a, center_b, halfsize_b):
+    """(E, A, B) surface-to-surface separation between two sets of boxes."""
+    delta = (center_a.unsqueeze(2) - center_b.unsqueeze(1)).abs()          # (E, A, B, 2)
+    halfsize_sum = halfsize_a.unsqueeze(1) + halfsize_b.unsqueeze(0)       # (A, B, 2)
+    return torch.norm(torch.clamp(delta - halfsize_sum, min=0.0), dim=-1)
+
+
+def spawn_batch(seed, num_envs=256):
+    config = make_test_config(num_envs=num_envs, n_agents=5, seed=seed)
+    world_state, scenario_state = scenario.reset(
+        num_envs, config, torch.Generator().manual_seed(seed)
+    )
+    return config, world_state, scenario_state
+
+
+def passage_width(config):
+    """What has to fit through a gap: the payload, flanked by an agent a side."""
+    return 2 * float(config.payload_halfsize.max()) + 4 * config.agent_radius
+
+
+def test_obstacle_layout_varies_across_environments_and_resets():
+    """The direct regression guard. Obstacle centers used to be one config
+    constant broadcast over the batch, so every environment of every episode
+    got the same four boxes in the same places."""
+    config, world_state, _ = spawn_batch(seed=0)
+    centers = world_state.obstacle_center
+
+    assert not torch.allclose(centers[0], centers[1]), "two environments share a layout"
+    assert centers.std(dim=0).min() > 0.1, \
+        "an obstacle lands in the same place in every environment"
+
+    generator = torch.Generator().manual_seed(0)
+    first, _ = scenario.reset(config.num_envs, config, generator)
+    second, _ = scenario.reset(config.num_envs, config, generator)
+    assert not torch.allclose(first.obstacle_center, second.obstacle_center), \
+        "a second reset reproduced the first layout"
+
+
+def test_obstacle_layout_is_reproducible_from_the_generator():
+    """Layouts must come from the env's generator and nothing else -- a
+    *_like sampler would read the global RNG and quietly make seeded rollouts
+    irreproducible, which is a bug this codebase has already hit once."""
+    config = make_test_config(num_envs=16)
+
+    first, _ = scenario.reset(config.num_envs, config, torch.Generator().manual_seed(7))
+    second, _ = scenario.reset(config.num_envs, config, torch.Generator().manual_seed(7))
+
+    assert torch.equal(first.obstacle_center, second.obstacle_center)
+
+
+def test_obstacles_clear_every_other_entity():
+    """Obstacles are placed last, so nothing already on the board may be
+    overlapping one when the episode starts."""
+    for seed in SPAWN_SEEDS:
+        config, world_state, scenario_state = spawn_batch(seed)
+        centers, halfsize = world_state.obstacle_center, world_state.obstacle_halfsize
+
+        agent_gap = point_box_distance(world_state.agent_pos, centers, halfsize)
+        assert agent_gap.min() > config.agent_radius, f"agent inside an obstacle (seed {seed})"
+
+        predator_gap = point_box_distance(world_state.predator_pos.unsqueeze(1), centers, halfsize)
+        assert predator_gap.min() > config.predator_radius, \
+            f"predator inside an obstacle (seed {seed})"
+
+        payload_gap = box_box_gap(world_state.payload_pos.unsqueeze(1),
+                                   config.payload_halfsize.unsqueeze(0), centers, halfsize)
+        assert payload_gap.min() > 0.0, f"payload inside an obstacle (seed {seed})"
+
+        # the goal needs more room than a point: the payload has to be able to
+        # rest anywhere inside the success circle without an obstacle in the
+        # way, and the marker the renderer draws is that whole circle
+        goal_gap = point_box_distance(scenario_state.goal_pos.unsqueeze(1), centers, halfsize)
+        payload_reach = config.success_threshold + float(torch.norm(config.payload_halfsize))
+        assert goal_gap.min() > payload_reach, f"obstacle clipping the goal (seed {seed})"
+
+
+def test_obstacles_never_seal_a_passage():
+    """DESIGN's clearance rule. Every obstacle pair leaves a gap the payload
+    and a flanking agent per side can pass through, which is what makes
+    walling off a region impossible for any arrangement at all."""
+    for seed in SPAWN_SEEDS:
+        config, world_state, _ = spawn_batch(seed)
+        centers, halfsize = world_state.obstacle_center, world_state.obstacle_halfsize
+
+        gap = box_box_gap(centers, halfsize, centers, halfsize)            # (E, K, K)
+        gap = gap.masked_fill(torch.eye(config.n_obstacles, dtype=torch.bool), float("inf"))
+
+        assert gap.min() > passage_width(config), f"obstacle pair too tight (seed {seed})"
+
+
+def test_obstacles_leave_the_perimeter_ring_clear():
+    """The clear ring at the boundary is the payload's guaranteed detour
+    around any interior cluster, so obstacles must stay out of it."""
+    for seed in SPAWN_SEEDS:
+        config, world_state, _ = spawn_batch(seed)
+
+        inner_face = min(
+            abs(float(center[int(torch.argmin(halfsize))])) - float(halfsize.min())
+            for center, halfsize in zip(config.wall_center, config.wall_halfsize)
+        )
+        extent = (world_state.obstacle_center.abs() + world_state.obstacle_halfsize).max()
+
+        assert float(extent) < inner_face - passage_width(config), \
+            f"obstacle encroaching on the perimeter ring (seed {seed})"
+
+
+def test_reset_at_resamples_obstacles_only_for_flagged_environments():
+    config = make_test_config(num_envs=4)
+    generator = torch.Generator().manual_seed(0)
+    world_state, scenario_state = scenario.reset(config.num_envs, config, generator)
+    before = world_state.obstacle_center.clone()
+
+    needs_reset = torch.tensor([True, False, True, False])
+    new_world, _ = scenario.reset_at(world_state, scenario_state, needs_reset, config, generator)
+
+    assert torch.equal(new_world.obstacle_center[1], before[1])
+    assert torch.equal(new_world.obstacle_center[3], before[3])
+    assert not torch.allclose(new_world.obstacle_center[0], before[0])
+    assert not torch.allclose(new_world.obstacle_center[2], before[2])
+
+
 # ---------------------------------------------------------------- rollout smoke test
 
 def test_long_rollout_never_produces_nan():

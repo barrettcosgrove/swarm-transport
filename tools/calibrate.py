@@ -35,10 +35,17 @@ def measure_cruising_speed(config, warmup_steps=50, measure_steps=100, seed=0):
     perp = torch.stack([-goal_dir[:, 1], goal_dir[:, 0]], dim=-1)
     predator_pos = world_state.payload_pos + perp * config.goal_radius
 
+    # obstacles parked out of reach, same reasoning. Obstacle centers are
+    # sampled per episode and are allowed to sit on the payload->goal line;
+    # this shove has no avoidance in it, so one in the way would be measured
+    # as the payload being slow rather than blocked.
+    obstacle_center = torch.full_like(world_state.obstacle_center, 1e6)
+
     world_state = dataclasses.replace(
         world_state,
         agent_pos=agent_pos, agent_vel=torch.zeros_like(agent_pos),
         predator_pos=predator_pos, predator_vel=torch.zeros_like(predator_pos),
+        obstacle_center=obstacle_center,
     )
 
     agent_action = goal_dir.unsqueeze(1)  # sustained max effort, straight at the goal

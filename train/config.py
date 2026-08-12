@@ -22,22 +22,19 @@ class Config:
     payload_mass: float = 5.0
 
     # static geometry. Walls are four boxes 1.0 thick whose inner faces sit at
-    # +/- 7.5, clearing the 5.4 goal ring plus 0.6 payload jitter.
-    wall_center: torch.Tensor = torch.tensor([[8.0, 0.0], [-8.0, 0.0], [0.0, 8.0], [0.0, -8.0]])
-    wall_halfsize: torch.Tensor = torch.tensor([[0.5, 8.5], [0.5, 8.5], [8.5, 0.5], [8.5, 0.5]])
+    # +/- 8.5. A goal center can sit 6.3 + 0.6 payload jitter = 6.9 from the
+    # origin, and its success circle reaches 7.65, so the old 7.5 faces would
+    # have clipped it.
+    wall_center: torch.Tensor = torch.tensor([[9.0, 0.0], [-9.0, 0.0], [0.0, 9.0], [0.0, -9.0]])
+    wall_halfsize: torch.Tensor = torch.tensor([[0.5, 9.5], [0.5, 9.5], [9.5, 0.5], [9.5, 0.5]])
 
     # physics.step has no notion of obstacle_active, so a disabled obstacle has
     # to be relocated out of reach rather than masked off.
     #
-    # Radius 4.3, spanning 3.8-4.8 along their axis. The inner edge clears the
-    # 3.6 predator spawn ring, which matters because the predator takes a
-    # uniformly random angle and would otherwise sometimes spawn inside a box.
-    # The outer edge now reaches into the success region (success_threshold
-    # 0.75 puts its inner edge at 5.4 - 0.75 = 4.65), so some goal angles have
-    # part of their success annulus behind an obstacle. Measured cost is about
-    # 3 points of scripted win rate, and DESIGN.md wants obstacles on the
-    # direct path, so this is left as-is rather than shrunk to fit.
-    obstacle_center: torch.Tensor = torch.tensor([[4.3, 0.0], [-4.3, 0.0], [0.0, 4.3], [0.0, -4.3]])
+    # No centers here: scenario.reset samples them per episode from the ring
+    # constants under "spawn geometry". A fixed layout put a box outer face at
+    # 4.8 against a success region starting at 4.65, so goal angles near an
+    # obstacle axis had the goal marker clipping into it.
     obstacle_halfsize: torch.Tensor = torch.full((4, 2), 0.5)
     obstacle_active: torch.Tensor = torch.ones(4, dtype=torch.bool)
 
@@ -74,8 +71,46 @@ class Config:
     r_agent_min: float = 1.2
     r_agent_max: float = 2.4
     predator_spawn_radius: float = 3.6
-    goal_radius: float = 5.4
+    # 6.3 rather than 5.4 so the obstacle band can end at 4.3 and still leave
+    # the goal's success circle clear. Below about 6.1 there is no radius on
+    # the payload->goal ray that clears both the predator and the goal, which
+    # would have forced obstacles off the direct path entirely.
+    goal_radius: float = 6.3
     goal_angle_jitter: float = 0.3
+
+    # Obstacle ring, sampled per episode by scenario.reset. Every bound is
+    # derived from a box's circumradius, 0.5 * sqrt(2) = 0.707 -- the
+    # conservative circular bound on a halfsize-0.5 box, which makes each
+    # clearance a single distance comparison regardless of relative angle.
+    #
+    #   band_min 3.5    clears the agent annulus. r_agent_max 2.4 +
+    #                   agent_radius 0.1 + 0.707 = 3.21, rounded up.
+    #   band_max 4.3    clears the goal. The payload must be able to rest
+    #                   anywhere inside the success circle, so an obstacle
+    #                   needs success_threshold 0.75 + payload circumradius
+    #                   0.283 + 0.707 = 1.74 of room, and 6.3 - 4.3 = 2.0.
+    #   corridor 0.35   clears the predator, which sits at radius 3.6 on
+    #                   theta. Closest approach across the band is
+    #                   3.6 * sin(0.35) = 1.24 against 0.857 required
+    #                   (predator_radius 0.15 + 0.707). Deliberately no wider:
+    #                   goal_angle_jitter is 0.3, so the payload's line to the
+    #                   goal still runs straight into a box some episodes,
+    #                   which is the point of having obstacles at all.
+    #   min_gap 0.75    DESIGN.md's clearance rule. Two obstacles this far
+    #                   apart at r >= 3.5 are at least 2 * 3.5 * sin(0.375) =
+    #                   2.56 apart, leaving 1.15 surface-to-surface -- wider
+    #                   than the payload (0.4) plus two agent diameters. No
+    #                   arrangement spaced this way can seal off a region.
+    #   n_sectors 6     the arc left after the wedge is 2*pi - 0.7 = 5.58, so
+    #                   at most 5.58 / 0.75 = 7 sectors can hold the gap. Six
+    #                   slots for four obstacles is what varies the layout:
+    #                   which sectors are occupied changes per episode, so
+    #                   some crowd one side and leave the other open.
+    obstacle_band_min: float = 3.5
+    obstacle_band_max: float = 4.3
+    obstacle_corridor_half_angle: float = 0.35
+    obstacle_min_angular_gap: float = 0.75
+    obstacle_n_sectors: int = 6
 
     # rewards
     progress_coef: float = 10.0
@@ -121,6 +156,16 @@ class Config:
     scripted_evade_radius: float = 3.0
     scripted_evade_gain: float = 3.0
     scripted_evade_tangent: float = 0.6
+
+    @property
+    def n_obstacles(self) -> int:
+        """How many obstacles a reset places, read off obstacle_halfsize.
+
+        Derived rather than stored so the count and the sizes cannot drift
+        apart -- a mismatch would only surface as a broadcast error deep in
+        physics.step.
+        """
+        return self.obstacle_halfsize.shape[0]
 
     @property
     def obs_dim(self) -> int:
