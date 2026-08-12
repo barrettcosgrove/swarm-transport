@@ -13,10 +13,11 @@ import dataclasses
 3. scenario.update_health()   -> updated health + cooldown + prev_health saved
 4. scenario.compute_reward()  -> reward tensor
 5. scenario.compute_done()    -> terminated, truncated
-6. scenario.observe()         -> observation tensor
+6. scenario.observe()         -> the pre-reset observation, kept in info
 7. build the info dict from the pre-reset state
 8. scenario.reset_at()        -> respawn the environments that finished
 9. dataclasses.replace on scenario_state to advance step_count and prev_payload_dist
+10. scenario.observe()        -> the observation actually returned, post-reset
 """
 
 class Env:
@@ -40,7 +41,7 @@ class Env:
         reward = scenario.compute_reward(self.world_state, self.scenario_state, training_progress, self.config)
         terminated, truncated = scenario.compute_done(self.world_state, self.scenario_state, self.config)
         needs_reset = terminated | truncated
-        observation = scenario.observe(self.world_state, self.scenario_state, self.config)
+        final_observation = scenario.observe(self.world_state, self.scenario_state, self.config)
         
         payload_dist = torch.norm(self.world_state.payload_pos - self.scenario_state.goal_pos, dim=-1)
         info = {
@@ -49,13 +50,29 @@ class Env:
             "captured": self.scenario_state.health <= 0.0,
             "world_state": self.world_state,
             "scenario_state": self.scenario_state,
+            # the last observation of the episode that just ended. GAE has to
+            # bootstrap a truncated episode from the value of where it actually
+            # stopped, which the returned observation no longer describes.
+            "final_observation": final_observation,
         }
         
         
         self.world_state, self.scenario_state = scenario.reset_at(self.world_state, self.scenario_state, needs_reset, self.config, self.generator)
         
+        # step_count advances after reset_at, so a freshly respawned environment
+        # reports step_count 1 on its first observation rather than 0 -- a
+        # one-step offset in time_remaining. Left alone deliberately:
+        # compute_done and the renderer both read step_count under this
+        # convention, and moving the increment would shift truncation by a step.
         current_payload_dist = torch.norm(self.world_state.payload_pos - self.scenario_state.goal_pos , dim=-1)
         self.scenario_state = dataclasses.replace(self.scenario_state, step_count=self.scenario_state.step_count + 1, prev_payload_dist=current_payload_dist)
+        
+        # observed AFTER reset_at, so what a rollout loop carries into the next
+        # step matches the state the simulation is actually in. Returning the
+        # pre-reset observation would feed the policy a stale board on every
+        # terminal step. Costs one extra observe(), which is subtractions and a
+        # gather -- negligible against physics.step.
+        observation = scenario.observe(self.world_state, self.scenario_state, self.config)
         
         return observation, reward, terminated, truncated, info
     
