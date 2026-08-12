@@ -77,17 +77,53 @@ def test_step_info_contents():
     actions = torch.rand(config.num_envs, config.n_agents, 2) * 2 - 1
     _, _, _, _, info = env.step(actions, training_progress=0.0)
 
-    for key in ("payload_dist", "success", "captured", "world_state", "scenario_state"):
+    for key in ("payload_dist", "success", "captured", "world_state", "scenario_state",
+                "final_observation"):
         assert key in info, f"info is missing {key}"
 
     for key in ("payload_dist", "success", "captured"):
         assert info[key].shape == (config.num_envs,), f"info[{key}] has the wrong shape"
+
+    assert info["final_observation"].shape == (config.num_envs, config.n_agents, config.obs_dim)
+    assert_finite(info["final_observation"], "info final_observation")
 
     assert_finite(info["payload_dist"], "info payload_dist")
     assert torch.equal(info["success"], info["payload_dist"] < config.success_threshold)
 
     assert isinstance(info["world_state"], WorldState)
     assert isinstance(info["scenario_state"], scenario.ScenarioState)
+
+
+def test_step_returns_the_post_reset_observation():
+    """A rollout loop assigns obs = next_obs and acts on it next step, so the
+    returned observation has to describe the state the simulation is actually
+    in. Returning the pre-reset one would hand the policy a stale board on
+    every terminal step; that pre-reset view lives in info["final_observation"]
+    instead, where GAE can bootstrap from it.
+    """
+    config = make_test_config(max_steps=3)
+    env = Env(config)
+    env.reset()
+
+    actions = torch.zeros(config.num_envs, config.n_agents, 2)
+    saw_a_reset = False
+    for _ in range(config.max_steps + 1):
+        obs, _, terminated, truncated, info = env.step(actions, training_progress=0.0)
+        done = terminated | truncated
+
+        # the returned observation must match a fresh observe() of the CURRENT
+        # state, which is what the next step will actually advance
+        expected = scenario.observe(env.world_state, env.scenario_state, config)
+        assert torch.equal(obs, expected), "the returned observation is not the current one"
+
+        if done.any():
+            saw_a_reset = True
+            assert not torch.equal(obs[done], info["final_observation"][done]), \
+                "a reset environment returned its pre-reset observation"
+            # untouched environments see the same thing either way
+            assert torch.equal(obs[~done], info["final_observation"][~done])
+
+    assert saw_a_reset, "no environment ended, so the post-reset path was never exercised"
 
 
 def test_truncation_fires_at_max_steps():
