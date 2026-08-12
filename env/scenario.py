@@ -152,6 +152,26 @@ def reset_at(world_state, scenario_state, needs_reset, config, generator) -> tup
 
     return new_world, new_scenario
     
+_NEIGHBOR_INDEX_CACHE = {}
+
+
+def _neighbor_index(n_agents, device) -> tuple[torch.Tensor, torch.Tensor]:
+    """(row, col) gather indices selecting every agent's teammates.
+
+    Cached rather than rebuilt per call: observe() runs every step, the indices
+    depend only on n_agents, and building them fresh both allocated needlessly
+    and left them on the CPU regardless of where the tensors being gathered
+    live -- which fails outright on CUDA.
+    """
+    key = (n_agents, str(device))
+    if key not in _NEIGHBOR_INDEX_CACHE:
+        col = torch.tensor([[j for j in range(n_agents) if j != i] for i in range(n_agents)],
+                           device=device)
+        row = torch.arange(n_agents, device=device).unsqueeze(1).expand(n_agents, n_agents - 1)
+        _NEIGHBOR_INDEX_CACHE[key] = (row, col)
+    return _NEIGHBOR_INDEX_CACHE[key]
+
+
 def observe(world_state, scenario_state, config) -> torch.Tensor: 
     E = world_state.agent_pos.shape[0]
     
@@ -165,9 +185,7 @@ def observe(world_state, scenario_state, config) -> torch.Tensor:
     rel_pos_other_agents = own_pos.unsqueeze(1) - own_pos.unsqueeze(2)
     rel_vel_other_agents = own_vel.unsqueeze(1) - own_vel.unsqueeze(2)
     
-    col_index = [[j for j in range(config.n_agents) if j != i] for i in range(config.n_agents)]
-    col_index = torch.tensor(col_index)
-    row_index = torch.arange(config.n_agents).unsqueeze(1).expand(config.n_agents, config.n_agents-1)
+    row_index, col_index = _neighbor_index(config.n_agents, own_pos.device)
     
     rel_pos_other_agents = rel_pos_other_agents[:, row_index, col_index].reshape(E, config.n_agents, -1)
     rel_vel_other_agents = rel_vel_other_agents[:, row_index, col_index].reshape(E, config.n_agents, -1)
@@ -190,7 +208,8 @@ def compute_reward(world_state, scenario_state, training_progress, config) -> to
     progress = scenario_state.prev_payload_dist - curr_payload_dist
     progress_reward = (config.progress_coef * progress).unsqueeze(1).expand(E, config.n_agents)
     
-    time_penalty = torch.full((E, config.n_agents), -config.time_penalty_coef)
+    time_penalty = torch.full((E, config.n_agents), -config.time_penalty_coef,
+                              device=world_state.agent_pos.device)
     
     success = curr_payload_dist < config.success_threshold
     success_reward = (success.float() * config.success_reward).unsqueeze(1).expand(E, config.n_agents)
