@@ -47,19 +47,15 @@ def _sample_obstacle_centers(payload_pos, theta, config, generator) -> torch.Ten
     # one. Negative means the sector count and the gap disagree, and every
     # clearance downstream is void.
     jitter_range = sector_width - config.obstacle_min_angular_gap
-    assert jitter_range >= 0.0, \
-        "obstacle_n_sectors too high to hold obstacle_min_angular_gap"
+    assert jitter_range >= 0.0, "obstacle_n_sectors too high to hold obstacle_min_angular_gap"
 
     # argsort of uniform keys is a random permutation per env, so the first
     # n_obstacles entries are distinct sectors
-    sector = torch.rand(E, config.obstacle_n_sectors, generator=generator, device=dev) \
-             .argsort(dim=-1)[:, :n_obstacles]
+    sector = torch.rand(E, config.obstacle_n_sectors, generator=generator, device=dev).argsort(dim=-1)[:, :n_obstacles]
     within_sector = torch.rand(E, n_obstacles, generator=generator, device=dev) * jitter_range
 
-    angle = theta.unsqueeze(1) + config.obstacle_corridor_half_angle \
-            + sector * sector_width + within_sector
-    radius = config.obstacle_band_min + torch.rand(E, n_obstacles, generator=generator, device=dev) \
-             * (config.obstacle_band_max - config.obstacle_band_min)
+    angle = theta.unsqueeze(1) + config.obstacle_corridor_half_angle + sector * sector_width + within_sector
+    radius = config.obstacle_band_min + torch.rand(E, n_obstacles, generator=generator, device=dev) * (config.obstacle_band_max - config.obstacle_band_min)
 
     offset = torch.stack([radius * torch.cos(angle), radius * torch.sin(angle)], dim=-1)
     return payload_pos.unsqueeze(1) + offset
