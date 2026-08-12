@@ -137,12 +137,26 @@ class Config:
     ent_coefficient: float = 0.001
     rollout_steps: int = 128
     update_epochs: int = 10
+    # T=128 * E=64 * N=5 = 40,960 samples an iteration, so this is 10
+    # minibatches per epoch. The MAPPO paper finds heavy minibatch splitting
+    # costs performance and stability; 20480 (2 minibatches) is the obvious
+    # one-variable experiment if value loss will not settle.
     minibatch_size: int = 4096
     num_iterations: int = 250
     lr: float = 3e-4
+    max_grad_norm: float = 0.5
+    # Off for the first run so a failure has one candidate cause. The +/-100
+    # terminal spikes next to -0.1--0.8 per-step terms are exactly the regime
+    # value normalization exists for, so this is the first thing to flip.
+    use_value_norm: bool = False
 
     # network
     hidden_dim: int = 128
+
+    # checkpointing and logging
+    checkpoint_interval: int = 25
+    checkpoint_dir: str = "train/checkpoints"
+    log_path: str = "outputs/training_history.json"
     
     # seed
     seed: int = 0
@@ -180,3 +194,19 @@ class Config:
         plus offset + rel vel for each teammate (4 each).
         """
         return 16 + 4 * (self.n_agents - 1)
+
+    @property
+    def state_dim(self) -> int:
+        """Width of the centralized critic's input: every agent's observation
+        concatenated, plus a one-hot agent id.
+
+        The one-hot is what distinguishes the n_agents rows of an environment's
+        critic input -- without it a deterministic network must return the same
+        value for every agent, which is wrong, since compute_reward gives each
+        agent a private proximity and collision term.
+
+        Grows linearly with n_agents while the sample budget does not. If value
+        loss will not settle, this is a candidate cause, and the fix is a
+        permutation-invariant encoder rather than raw concatenation.
+        """
+        return self.n_agents * self.obs_dim + self.n_agents
