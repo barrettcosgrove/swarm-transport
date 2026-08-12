@@ -113,25 +113,25 @@ class Config:
     obstacle_n_sectors: int = 6
 
     # rewards
-    progress_coef: float = 10.0
-    time_penalty_coef: float = 0.3
+    progress_coef: float = 11.1
+    time_penalty_coef: float = 0.083
     # payload-center to goal-center. The payload's half-diagonal is 0.283, so
     # at the old 0.3 it had to be almost exactly centered on the goal; 0.75
     # only asks it to overlap.
     success_threshold: float = 0.75
     success_reward: float = 100.0
-    proximity_coef_start: float = 5.0
+    proximity_coef_start: float = 0.014
     proximity_anneal_fraction: float = 0.3
     health_loss_coef: float = 0.8
     # flat drain per damage event. With the cooldown gating events to one per
     # predator_cooldown_duration steps, max_health / this = contacts survived.
     health_loss_per_step: float = 10.0
     captured_reward: float = -100.0
-    collision_coef: float = 0.1
+    collision_coef: float = 0.0002
     max_health: float = 100.0
 
     # training
-    gamma: float = 0.99
+    gamma: float = 0.999
     gae_lambda: float = 0.95
     clip_epsilon: float = 0.2
     ent_coefficient: float = 0.001
