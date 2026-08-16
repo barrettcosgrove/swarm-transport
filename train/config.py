@@ -21,12 +21,26 @@ class Config:
     payload_halfsize: torch.Tensor = torch.tensor([0.2, 0.2])
     payload_mass: float = 5.0
 
-    # static geometry. Walls are four boxes 1.0 thick whose inner faces sit at
+    # static geometry. Walls are four boxes 3.0 thick whose inner faces sit at
     # +/- 8.5. A goal center can sit 6.3 + 0.6 payload jitter = 6.9 from the
     # origin, and its success circle reaches 7.65, so the old 7.5 faces would
     # have clipped it.
-    wall_center: torch.Tensor = torch.tensor([[9.0, 0.0], [-9.0, 0.0], [0.0, 9.0], [0.0, -9.0]])
-    wall_halfsize: torch.Tensor = torch.tensor([[0.5, 9.5], [0.5, 9.5], [9.5, 0.5], [9.5, 0.5]])
+    #
+    # The thickness is a containment guarantee, not decoration. A penalty force
+    # resolves a deep overlap along the shortest way out, so once a body's
+    # center passes a wall's midline the nearest face is the OUTER one and the
+    # wall starts pushing it away from the arena -- at 1200 stiffness, hard
+    # enough that it never comes back. Walls were 1.0 thick, putting that
+    # midline at 9.0, only 0.6 beyond first contact at 8.4; agents cleared it
+    # in a single step and 21% of them left the arena for good. At half-thickness
+    # 1.5 the midline sits at 10.0, 1.6 past first contact, against a capped
+    # step of agent_max_speed * dt = 1.0. Keep that margin if either is retuned;
+    # tests/test_physics.py asserts it.
+    #
+    # The long halfsize is each wall's outer face, so the four boxes still
+    # overlap at the corners and seal them.
+    wall_center: torch.Tensor = torch.tensor([[10.0, 0.0], [-10.0, 0.0], [0.0, 10.0], [0.0, -10.0]])
+    wall_halfsize: torch.Tensor = torch.tensor([[1.5, 11.5], [1.5, 11.5], [11.5, 1.5], [11.5, 1.5]])
 
     # physics.step has no notion of obstacle_active, so a disabled obstacle has
     # to be relocated out of reach rather than masked off.
@@ -47,6 +61,15 @@ class Config:
     predator_drag_coef: float = 0.25
     payload_drag_coef: float = 0.1
     agent_max_thrust: float = 5.0
+    # thrust/drag, the fastest an agent can drive itself. As a cap it does not
+    # restrain the engine at all; it stops CONTACT forces from launching an
+    # agent faster than the engine ever could. Without it a wall rebound
+    # reached 59 units/s -- 3 units per step against a 3.0 thick wall -- which
+    # is how agents ended up outside the arena. Measured in-arena speeds are
+    # p90 10.1, p99 17.2, p99.9 22.7, so this trims the contact-force tail and
+    # leaves ordinary motion untouched. A tighter 10.0 would have clipped 10%
+    # of normal movement.
+    agent_max_speed: float = 20.0
     # a hard velocity cap, applied in physics.integrate. Without it the real
     # top speed is thrust/drag = 14, four times the nominal value this used to
     # carry, and the predator covers 0.7 units per step against a 0.25 contact
@@ -148,7 +171,7 @@ class Config:
     # Off for the first run so a failure has one candidate cause. The +/-100
     # terminal spikes next to -0.1--0.8 per-step terms are exactly the regime
     # value normalization exists for, so this is the first thing to flip.
-    use_value_norm: bool = False
+    use_value_norm: bool = True
 
     # network
     hidden_dim: int = 128

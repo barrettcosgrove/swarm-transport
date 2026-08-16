@@ -582,21 +582,37 @@ class MAPPOTrainer:
 
     # ------------------------------------------------------------ outer loop
 
-    def train(self, verbose=True):
+    def train(self, verbose=True, max_iterations=None, anneal_lr=True):
+        """Train for all configured iterations or stop after a shorter preview.
+
+        max_iterations limits how many iterations execute without changing
+        config.num_iterations. That distinction matters because num_iterations
+        remains the denominator for training_progress and the learning-rate
+        schedule, so a 30-iteration preview can represent iterations 1--30 of a
+        planned 250-iteration run rather than compressing the full schedule
+        into 30 iterations.
+
+        Set anneal_lr=False for a constant-learning-rate experiment. Reward
+        curriculum progress still uses config.num_iterations.
+        """
         cfg = self.config
         self.obs = self.env.reset()
 
-        for iteration in range(1, cfg.num_iterations + 1):
+        stop_at = cfg.num_iterations if max_iterations is None else min(max_iterations, cfg.num_iterations)
+        if stop_at < 1:
+            raise ValueError("max_iterations must be at least 1")
+
+        for iteration in range(1, stop_at + 1):
             progress = (iteration - 1) / cfg.num_iterations
 
             last_value, outcomes = self.collect_rollout(progress)
             advantages, returns = self.buffer.compute_gae(last_value, cfg.gamma, cfg.gae_lambda)
             flat = self.buffer.flatten(self.critic, advantages, returns)
 
-            # linear anneal, into both optimizers. lr reaches 0 exactly at
-            # num_iterations, so shortening a run is not the same schedule
-            # compressed -- it is a truncated one.
-            lr_now = cfg.lr * (1.0 - progress)
+            # Linear anneal uses the configured full-run horizon even when
+            # max_iterations stops a preview early. It can be disabled to
+            # isolate constant learning rate as a single-variable experiment.
+            lr_now = cfg.lr * (1.0 - progress) if anneal_lr else cfg.lr
             for optimizer in (self.optimizer_actor, self.optimizer_critic):
                 for group in optimizer.param_groups:
                     group["lr"] = lr_now
@@ -622,8 +638,9 @@ class MAPPOTrainer:
             if verbose:
                 print(TrainingLogger.format(record), flush=True)
 
-            if iteration % cfg.checkpoint_interval == 0 or iteration == cfg.num_iterations:
-                self.save_periodic(iteration)
+            is_final = iteration == stop_at
+            if iteration % cfg.checkpoint_interval == 0 or is_final:
+                self.save_periodic(iteration, final=is_final)
 
         self.logger.write()
         return self.logger.history
@@ -641,7 +658,7 @@ class MAPPOTrainer:
                                self.value_normalizer,
                                map_location or self.config.device)
 
-    def save_periodic(self, iteration):
+    def save_periodic(self, iteration, final=False):
         """checkpoint_latest.pt every interval, numbered snapshots more rarely.
 
         Overwriting one latest file is what makes a frequent interval cheap;
@@ -651,7 +668,7 @@ class MAPPOTrainer:
         cfg = self.config
         paths = [os.path.join(cfg.checkpoint_dir, "checkpoint_latest.pt")]
         keep_interval = 4 * cfg.checkpoint_interval
-        if iteration % keep_interval == 0 or iteration == cfg.num_iterations:
+        if iteration % keep_interval == 0 or final:
             paths.append(os.path.join(cfg.checkpoint_dir, f"checkpoint_{iteration}.pt"))
         for path in paths:
             self.save(path, iteration)

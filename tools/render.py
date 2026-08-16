@@ -136,10 +136,22 @@ def compute_arena_limit(config, margin=1.15):
     View bounds derived from the walls themselves, rather than a separate
     hardcoded constant that could drift out of sync with the actual arena
     size as it gets tuned during Phase 2 calibration.
+
+    Measured to each wall's INNER face, not its outer extent, so the framing
+    tracks the playable area rather than how thick the walls happen to be.
+    Wall thickness is a containment constant chosen in train/config.py to keep
+    a fast body from crossing a wall's midline, and it has no business
+    deciding how far the camera pulls back -- at 3.0 thick, outer extents
+    would spend a fifth of the frame on grey border. The walls simply clip at
+    the frame edge, which reads the same as a solid boundary.
     """
     max_extent = 0.0
     for center, halfsize in zip(config.wall_center, config.wall_halfsize):
-        max_extent = max(max_extent, abs(center[0]) + halfsize[0], abs(center[1]) + halfsize[1])
+        # the thin axis is the one the wall's face is on; the long axis just
+        # runs the wall far enough to seal the corners
+        thin_axis = int(torch.argmin(halfsize))
+        inner_face = abs(float(center[thin_axis])) - float(halfsize[thin_axis])
+        max_extent = max(max_extent, inner_face)
     return max_extent * margin
 
 

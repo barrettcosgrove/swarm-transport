@@ -108,7 +108,7 @@ def box_box_forces(payload_center, payload_halfsize, box_center, box_halfsize, s
     force = force_magnitude * direction
     return force.sum(dim=1)
 
-def step(world_state, agent_actions, predator_actions, dt, agent_max_thrust, predator_max_thrust, agent_drag_coef, predator_drag_coef, payload_drag_coef, body_stiffness,wall_stiffness, obstacle_stiffness, payload_stiffness, predator_max_speed=None):
+def step(world_state, agent_actions, predator_actions, dt, agent_max_thrust, predator_max_thrust, agent_drag_coef, predator_drag_coef, payload_drag_coef, body_stiffness,wall_stiffness, obstacle_stiffness, payload_stiffness, predator_max_speed=None, agent_max_speed=None):
     agent_thrust = agent_actions * agent_max_thrust
     agent_drag = -agent_drag_coef * world_state.agent_vel
     
@@ -152,7 +152,10 @@ def step(world_state, agent_actions, predator_actions, dt, agent_max_thrust, pre
     predator_total_force = predator_thrust + predator_drag + force_predator_from_agent + force_predator_from_payload + force_predator_wall + force_predator_obstacle
     payload_total_force = payload_drag + force_payload_from_agent + force_payload_from_predator + force_payload_wall + force_payload_obstacle
     
-    new_agent_pos, new_agent_vel = integrate(world_state.agent_pos, world_state.agent_vel, agent_total_force, world_state.agent_mass, dt)
+    # capped for the same reason as the predator: a penalty force resolving a
+    # deep overlap can be hundreds of newtons, and one step of that turns a
+    # rebound into a body moving faster than any thrust could drive it
+    new_agent_pos, new_agent_vel = integrate(world_state.agent_pos, world_state.agent_vel, agent_total_force, world_state.agent_mass, dt, max_speed=agent_max_speed)
     new_predator_pos, new_predator_vel = integrate(world_state.predator_pos, world_state.predator_vel, predator_total_force, world_state.predator_mass, dt, max_speed=predator_max_speed)
     new_payload_pos, new_payload_vel = integrate(world_state.payload_pos, world_state.payload_vel, payload_total_force, world_state.payload_mass, dt)
     

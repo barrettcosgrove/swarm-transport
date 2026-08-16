@@ -8,6 +8,7 @@ which tests world.py + physics.py in isolation.
 Run with: pytest tests/test_env.py -v
 """
 import dataclasses
+import math
 import torch
 import pytest
 
@@ -377,3 +378,80 @@ def test_long_rollout_never_produces_nan():
         assert_finite(reward, f"reward at step {step_idx}")
         assert not (terminated & truncated).any(), \
             f"step {step_idx}: an environment reported both terminated and truncated"
+
+
+# ---------------------------------------------------------------- containment
+#
+# DESIGN.md's stated reason for having walls at all: a body that cannot leave
+# keeps observations bounded, and an unbounded state space is bad input for a
+# network. These pin that end to end, through env.step rather than at the
+# physics layer, because the failure that motivated them was a config value
+# not being passed down -- exactly the kind of gap a physics-only test misses.
+
+def wall_midline(config):
+    """Distance from the origin to the center of a wall.
+
+    Not the inner face. A penalty force resolves an overlap along the
+    shortest way out, so a body past a wall's center gets pushed toward the
+    OUTER face and is expelled from the arena for good. Sinking into a wall
+    is ordinary; reaching its center is not survivable.
+    """
+    return min(
+        abs(float(center[int(torch.argmin(halfsize))]))
+        for center, halfsize in zip(config.wall_center, config.wall_halfsize)
+    )
+
+
+def sustained_thrust_actions(config):
+    """One fixed compass direction per agent, held for the whole rollout.
+
+    Random per-step actions average out to almost no displacement and never
+    put a body near a wall, so they cannot catch a containment bug -- the
+    rollout smoke test above ran 300 steps of them without ever coming close.
+    Committing each agent to one direction and never letting up is what
+    drives every body into a wall and holds it there.
+    """
+    angles = torch.arange(config.num_envs * config.n_agents).float()
+    angles = angles * (2 * math.pi / (config.num_envs * config.n_agents))
+    directions = torch.stack([torch.cos(angles), torch.sin(angles)], dim=-1)
+    return directions.view(config.num_envs, config.n_agents, 2)
+
+
+def test_sustained_thrust_cannot_push_a_body_out_of_the_arena():
+    """Every agent drives into a wall and stays there for several episodes.
+
+    This is the regression test for agents escaping: before the speed cap
+    and the thicker walls, bodies crossed a wall's midline, were ejected by
+    the very force meant to contain them, and reached positions past 370.
+    """
+    config = make_test_config(num_envs=8, n_agents=5, max_steps=100)
+    env = Env(config)
+    env.reset()
+    actions = sustained_thrust_actions(config)
+    midline = wall_midline(config)
+
+    max_agent = 0.0
+    max_payload = 0.0
+    max_obs = 0.0
+    for step_idx in range(400):
+        obs, _, _, _, info = env.step(actions, training_progress=step_idx / 400)
+        world = info["world_state"]
+        max_agent = max(max_agent, float(world.agent_pos.abs().max()))
+        max_payload = max(max_payload, float(world.payload_pos.abs().max()))
+        # health is the trailing channel and lives on a 0-100 scale of its own,
+        # so it is excluded rather than folded into a spatial bound
+        max_obs = max(max_obs, float(obs[..., :-1].abs().max()))
+
+    assert max_agent < midline, f"an agent reached {max_agent:.1f}, past the wall midline at {midline}"
+
+    # the payload has no speed cap and rests entirely on the geometric margin,
+    # so it gets its own assertion rather than riding on the agents'
+    assert max_payload < midline, f"the payload reached {max_payload:.1f}, past the wall midline"
+
+    # the point of all of the above. Every remaining channel is a position, an
+    # offset between two of them, or a relative velocity, so the widest any of
+    # them can legitimately get is two arenas or two speed caps. One escaped
+    # agent used to drag this past 370, and it poisons its four teammates'
+    # observations too, through the relative-position block.
+    bound = max(2 * midline, 2 * config.agent_max_speed)
+    assert max_obs < bound, f"observations reached {max_obs:.1f} with bodies still inside the arena"

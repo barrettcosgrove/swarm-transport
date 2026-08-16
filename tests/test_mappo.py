@@ -450,6 +450,22 @@ def test_learning_rate_anneals_to_zero_across_the_run():
     os.remove(config.log_path)
 
 
+def test_preview_stops_early_without_compressing_or_annealing_learning_rate():
+    config = make_test_config(rollout_steps=8, max_steps=20, num_iterations=250,
+                              log_path="outputs/_test_preview.json",
+                              checkpoint_dir="train/checkpoints/_test_preview")
+    history = MAPPOTrainer(config).train(verbose=False, max_iterations=3, anneal_lr=False)
+
+    assert len(history) == 3
+    assert [record["iteration"] for record in history] == [1, 2, 3]
+    assert all(record["learning_rate"] == config.lr for record in history)
+    assert os.path.exists(f"{config.checkpoint_dir}/checkpoint_latest.pt")
+    assert os.path.exists(f"{config.checkpoint_dir}/checkpoint_3.pt")
+
+    shutil.rmtree(config.checkpoint_dir)
+    os.remove(config.log_path)
+
+
 def test_seeding_makes_a_rollout_reproducible():
     """Normal.sample() reads the global RNG, so this fails unless the trainer
     seeds it -- the environment's own generator is not enough."""

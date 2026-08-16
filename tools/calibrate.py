@@ -57,7 +57,7 @@ def measure_cruising_speed(config, warmup_steps=50, measure_steps=100, seed=0):
             config.agent_max_thrust, config.predator_max_thrust,
             config.agent_drag_coef, config.predator_drag_coef, config.payload_drag_coef,
             config.body_stiffness, config.wall_stiffness, config.obstacle_stiffness, config.payload_stiffness,
-            config.predator_max_speed,
+            config.predator_max_speed, agent_max_speed=config.agent_max_speed,
         )
 
     for _ in range(warmup_steps):        # let thrust/drag reach equilibrium before measuring
