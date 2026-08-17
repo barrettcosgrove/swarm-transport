@@ -214,10 +214,26 @@ def compute_reward(world_state, scenario_state, training_progress, config) -> to
     success = curr_payload_dist < config.success_threshold
     success_reward = (success.float() * config.success_reward).unsqueeze(1).expand(E, config.n_agents)
     
-    dist_agent_to_payload = torch.norm(world_state.payload_pos.unsqueeze(1) - world_state.agent_pos, dim=-1)
-    anneal_fraction = min(training_progress / config.proximity_anneal_fraction, 1.0)
-    proximity_coef = config.proximity_coef_start * (1 - anneal_fraction)
+    agent_to_payload = world_state.payload_pos.unsqueeze(1) - world_state.agent_pos
+    dist_agent_to_payload = torch.norm(agent_to_payload, dim=-1)
+    proximity_anneal = min(training_progress / config.proximity_anneal_fraction, 1.0)
+    proximity_coef = config.proximity_coef_start * (1 - proximity_anneal)
     proximity_reward = -proximity_coef * dist_agent_to_payload
+    
+    # Cosine between "which way does this agent face the payload" and "which
+    # way does the payload have to travel". +1 is directly behind the payload,
+    # the one place a push helps; -1 is in the payload's path. Signed rather
+    # than clamped at zero, so blocking the payload costs what pushing it pays.
+    #
+    # A direction, not a position, so it is scale-free: it says nothing about
+    # closing in, which is proximity's job, and the two anneal independently.
+    agent_to_payload_dir = agent_to_payload / agent_to_payload.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+    goal_dir = scenario_state.goal_pos - world_state.payload_pos
+    goal_dir = (goal_dir / goal_dir.norm(dim=-1, keepdim=True).clamp(min=1e-6)).unsqueeze(1)
+    alignment = (agent_to_payload_dir * goal_dir).sum(-1)          # (E, n_agents) in [-1, 1]
+    alignment_anneal = min(training_progress / config.alignment_anneal_fraction, 1.0)
+    alignment_coef = config.alignment_coef_start * (1 - alignment_anneal)
+    alignment_reward = alignment_coef * alignment
     
     health_loss = scenario_state.prev_health - scenario_state.health
     health_loss_reward =  (-config.health_loss_coef * health_loss).unsqueeze(1).expand(E, config.n_agents)
@@ -230,7 +246,7 @@ def compute_reward(world_state, scenario_state, training_progress, config) -> to
     collision_magnitude = torch.norm(agent_wall_force + agent_obstacle_force, dim=-1)
     collision_reward =  -config.collision_coef * collision_magnitude
     
-    reward = progress_reward + time_penalty + success_reward + proximity_reward + health_loss_reward + captured_reward + collision_reward
+    reward = progress_reward + time_penalty + success_reward + proximity_reward + alignment_reward + health_loss_reward + captured_reward + collision_reward
     return reward
     
 def compute_done(world_state, scenario_state, config) -> tuple[torch.Tensor, torch.Tensor]:

@@ -80,9 +80,9 @@ class Config:
     # actually touching (agent_radius + predator_radius = 0.25) so contact is
     # not missed when a fast agent steps clean past the predator.
     predator_capture_radius: float = 0.4
-    predator_cooldown_duration: float = 10.0
+    predator_cooldown_duration: float = 25.0
     predator_cooldown_speed_factor: float = 0.5
-    predator_weight: float = 1.0       # w in the guard formula
+    predator_weight: float = 0.5       # w in the guard formula
     # steps the predator sticks with a target before reconsidering. 20 is one
     # second at dt 0.05 -- long enough that fleeing actually shakes it.
     predator_target_commit_steps: float = 20.0
@@ -136,20 +136,34 @@ class Config:
     obstacle_n_sectors: int = 6
 
     # rewards
-    progress_coef: float = 11.1
-    time_penalty_coef: float = 0.083
+    progress_coef: float = 50
+    time_penalty_coef: float = 0.22
     # payload-center to goal-center. The payload's half-diagonal is 0.283, so
     # at the old 0.3 it had to be almost exactly centered on the goal; 0.75
     # only asks it to overlap.
     success_threshold: float = 0.75
-    success_reward: float = 100.0
-    proximity_coef_start: float = 0.014
-    proximity_anneal_fraction: float = 0.3
-    health_loss_coef: float = 0.8
+    success_reward: float = 450.0
+    proximity_coef_start: float = 0.85
+    proximity_anneal_fraction: float = 0.6
+    # Pays for standing on the far side of the payload from the goal, where a
+    # push actually moves it where it needs to go. Proximity says "get close"
+    # and is indifferent about which side you close in on, so the two are
+    # separate terms.
+    #
+    # Scored on a cosine, so the coefficient IS the per-step magnitude at best
+    # alignment. Kept near the time penalty rather than near proximity: this
+    # only orients agents that are already converging, and a large signed term
+    # would make the wrong side of the payload cost more than wasting a step.
+    # Annealed on the same reasoning as proximity -- a hint about where to be
+    # while progress is too sparse to learn from, removed once pushing works,
+    # which is also what stops agents from orbiting to farm the cosine.
+    alignment_coef_start: float = 0.3
+    alignment_anneal_fraction: float = 0.6
+    health_loss_coef: float = 1.0
     # flat drain per damage event. With the cooldown gating events to one per
     # predator_cooldown_duration steps, max_health / this = contacts survived.
     health_loss_per_step: float = 10.0
-    captured_reward: float = -100.0
+    captured_reward: float = -150.0
     collision_coef: float = 0.0002
     max_health: float = 100.0
 
