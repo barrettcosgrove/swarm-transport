@@ -230,6 +230,13 @@ class Config:
     # traversal. At 100 the budget was 260 and arrival was impossible.
     max_health: float = 150.0
 
+    # observation scaling. Positions / 8.5 maps the arena inner faces to
+    # [-1, 1]; velocities / 5.0 maps ordinary motion similarly. Offsets are
+    # computed in world units first, then divided, so a relative vector
+    # cannot pick up a scale from only one of its two ends.
+    obs_pos_scale: float = 8.5   # arena half-extent
+    obs_vel_scale: float = 5.0   # typical agent speed
+
     # training
     gamma: float = 0.999
     gae_lambda: float = 0.95

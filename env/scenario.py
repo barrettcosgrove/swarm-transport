@@ -189,28 +189,28 @@ def _neighbor_index(n_agents, device) -> tuple[torch.Tensor, torch.Tensor]:
 def observe(world_state, scenario_state, config) -> torch.Tensor: 
     E = world_state.agent_pos.shape[0]
     
-    own_pos = world_state.agent_pos
-    own_vel = world_state.agent_vel
+    own_pos = world_state.agent_pos / config.obs_pos_scale
+    own_vel = world_state.agent_vel / config.obs_vel_scale
     
-    goal_offset = scenario_state.goal_pos.unsqueeze(1) - own_pos
-    payload_offset = world_state.payload_pos.unsqueeze(1) - own_pos
-    payload_rel_vel = world_state.payload_vel.unsqueeze(1) - own_vel
+    goal_offset = (scenario_state.goal_pos.unsqueeze(1) - world_state.agent_pos) / config.obs_pos_scale
+    payload_offset = (world_state.payload_pos.unsqueeze(1) - world_state.agent_pos) / config.obs_pos_scale
+    payload_rel_vel = (world_state.payload_vel.unsqueeze(1) - world_state.agent_vel) / config.obs_vel_scale
     
-    rel_pos_other_agents = own_pos.unsqueeze(1) - own_pos.unsqueeze(2)
-    rel_vel_other_agents = own_vel.unsqueeze(1) - own_vel.unsqueeze(2)
+    rel_pos_other_agents = world_state.agent_pos.unsqueeze(1) - world_state.agent_pos.unsqueeze(2)
+    rel_vel_other_agents = world_state.agent_vel.unsqueeze(1) - world_state.agent_vel.unsqueeze(2)
     
-    row_index, col_index = _neighbor_index(config.n_agents, own_pos.device)
+    row_index, col_index = _neighbor_index(config.n_agents, world_state.agent_pos.device)
     
-    rel_pos_other_agents = rel_pos_other_agents[:, row_index, col_index].reshape(E, config.n_agents, -1)
-    rel_vel_other_agents = rel_vel_other_agents[:, row_index, col_index].reshape(E, config.n_agents, -1)
+    rel_pos_other_agents = rel_pos_other_agents[:, row_index, col_index].reshape(E, config.n_agents, -1) / config.obs_pos_scale
+    rel_vel_other_agents = rel_vel_other_agents[:, row_index, col_index].reshape(E, config.n_agents, -1) / config.obs_vel_scale
     
     time_remaining = 1 - scenario_state.step_count / config.max_steps
     time_remaining = time_remaining.unsqueeze(1).expand(E, config.n_agents).unsqueeze(2)
     
-    predator_offset = world_state.predator_pos.unsqueeze(1) - own_pos
-    predator_rel_vel = world_state.predator_vel.unsqueeze(1) - own_vel
+    predator_offset = (world_state.predator_pos.unsqueeze(1) - world_state.agent_pos) / config.obs_pos_scale
+    predator_rel_vel = (world_state.predator_vel.unsqueeze(1) - world_state.agent_vel) / config.obs_vel_scale
     
-    shared_health = scenario_state.health.unsqueeze(1).expand(E, config.n_agents).unsqueeze(2)
+    shared_health = scenario_state.health.unsqueeze(1).expand(E, config.n_agents).unsqueeze(2) / config.max_health
     
     obs = torch.cat([own_pos, own_vel, goal_offset, payload_offset, payload_rel_vel, rel_pos_other_agents, rel_vel_other_agents, time_remaining, predator_offset, predator_rel_vel, shared_health], dim=-1)
     return obs

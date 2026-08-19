@@ -148,26 +148,26 @@ def test_truncation_fires_at_max_steps():
 
 def test_observe_own_pos_matches_world_state():
     """The first slice of the observation vector should be each agent's own
-    position, taken directly from world_state -- no transformation at all."""
+    position, divided by obs_pos_scale so the arena maps to roughly [-1, 1]."""
     config = make_test_config(num_envs=1, n_agents=2)
     world_state, scenario_state = scenario.reset(config.num_envs, config, torch.Generator().manual_seed(0))
 
     obs = scenario.observe(world_state, scenario_state, config)
     own_pos_from_obs = obs[..., 0:2]
 
-    assert torch.allclose(own_pos_from_obs, world_state.agent_pos, atol=1e-5)
+    assert torch.allclose(own_pos_from_obs, world_state.agent_pos / config.obs_pos_scale, atol=1e-5)
 
 
 def test_observe_goal_offset_matches_manual_calc():
-    """The goal-offset slice should equal goal_pos - agent_pos, computed by
-    hand against the same world/scenario state observe() receives."""
+    """The goal-offset slice should equal (goal_pos - agent_pos) / obs_pos_scale,
+    computed by hand against the same world/scenario state observe() receives."""
     config = make_test_config(num_envs=1, n_agents=2)
     world_state, scenario_state = scenario.reset(config.num_envs, config, torch.Generator().manual_seed(0))
 
     obs = scenario.observe(world_state, scenario_state, config)
     goal_offset_from_obs = obs[..., 4:6]   # adjust the slice if your field order differs
 
-    expected = scenario_state.goal_pos.unsqueeze(1) - world_state.agent_pos
+    expected = (scenario_state.goal_pos.unsqueeze(1) - world_state.agent_pos) / config.obs_pos_scale
     assert torch.allclose(goal_offset_from_obs, expected, atol=1e-5)
 
 
