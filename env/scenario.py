@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 import torch
 from .world import WorldState
-from .physics import circle_box_static_forces, circle_box_dynamic_forces
+from .physics import circle_box_static_forces
 import math 
 import dataclasses
 
@@ -17,6 +17,7 @@ class ScenarioState:
     # feed are private to each agent
     prev_agent_payload_dist: torch.Tensor   # (E, n_agents)
     prev_alignment: torch.Tensor            # (E, n_agents)
+    prev_agent_pushpoint_dist: torch.Tensor # (E, n_agents)
     predator_noise: torch.Tensor      # (E, 2)
     predator_target: torch.Tensor     # (E,) long -- agent the predator is committed to
     predator_retarget_timer: torch.Tensor  # (E,) steps left before it may reconsider
@@ -111,6 +112,8 @@ def reset(num_envs, config, generator) -> (WorldState, ScenarioState):
     )
 
     agent_payload_dist, alignment = agent_payload_geometry(agent_pos, payload_pos, goal_pos)
+    agent_pushpoint_dist = agent_pushpoint_geometry(
+        agent_pos, payload_pos, goal_pos, config.push_standoff)
 
     scenario_state = ScenarioState(
         goal_pos=goal_pos,
@@ -123,6 +126,7 @@ def reset(num_envs, config, generator) -> (WorldState, ScenarioState):
         # real one-step delta rather than a jump from zero
         prev_agent_payload_dist=agent_payload_dist,
         prev_alignment=alignment,
+        prev_agent_pushpoint_dist=agent_pushpoint_dist,
         predator_noise=torch.zeros(E, 2, device=dev),
         # timer at zero so the first step picks a target normally
         predator_target=torch.zeros(E, dtype=torch.long, device=dev),
@@ -158,6 +162,7 @@ def reset_at(world_state, scenario_state, needs_reset, config, generator) -> tup
         # broadcast across the agent axis instead of the env axis
         prev_agent_payload_dist=torch.where(mask2, fresh_scenario.prev_agent_payload_dist, scenario_state.prev_agent_payload_dist),
         prev_alignment=torch.where(mask2, fresh_scenario.prev_alignment, scenario_state.prev_alignment),
+        prev_agent_pushpoint_dist=torch.where(mask2, fresh_scenario.prev_agent_pushpoint_dist, scenario_state.prev_agent_pushpoint_dist),
         prev_health=torch.where(mask1, fresh_scenario.prev_health, scenario_state.prev_health),
         predator_noise=torch.where(mask2, fresh_scenario.predator_noise, scenario_state.predator_noise),
         predator_target=torch.where(mask1, fresh_scenario.predator_target, scenario_state.predator_target),
@@ -238,6 +243,20 @@ def agent_payload_geometry(agent_pos, payload_pos, goal_pos) -> tuple[torch.Tens
     return dist, (agent_to_payload_dir * goal_dir).sum(-1)
 
 
+def agent_pushpoint_geometry(agent_pos, payload_pos, goal_pos, standoff):
+    """Distance from each agent to the standoff point behind the payload,
+    on the payload->goal line. Same shape as agent_payload_geometry's first
+    return, but the target is where a push actually helps, not the payload's
+    center -- so closing this distance and being usefully positioned are the
+    same thing instead of two objectives that can point different directions.
+    """
+    goal_dir = goal_pos - payload_pos
+    goal_dir = goal_dir / goal_dir.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+    push_point = payload_pos - goal_dir * standoff          # (E, 2)
+    dist = (push_point.unsqueeze(1) - agent_pos).norm(dim=-1)  # (E, n_agents)
+    return dist
+
+
 def reward_terms(world_state, scenario_state, training_progress, config) -> dict[str, torch.Tensor]:
     """Every reward component separately, each (E, n_agents), keyed by name.
 
@@ -266,10 +285,11 @@ def reward_terms(world_state, scenario_state, training_progress, config) -> dict
     success = curr_payload_dist < config.success_threshold
     success_reward = (success.float() * config.success_reward).unsqueeze(1).expand(E, config.n_agents)
     
-    # Proximity stays a delta: it pays for closing in from spawn, then nothing
-    # once you have arrived, so it cannot be farmed by hovering. Alignment used
-    # to be the same shape and summed to ~0 over a run -- telescoping cannot
-    # teach a standing push. That job moves to push_reward below.
+    # Proximity stays a delta to the payload center: it pays for closing in
+    # from spawn, then nothing once you have arrived, so it cannot be farmed
+    # by hovering. Alignment used to be the same shape and summed to ~0 over
+    # a run. Push below is also a delta, but the target is the standoff point
+    # behind the payload rather than its center.
     curr_agent_payload_dist, _ = agent_payload_geometry(
         world_state.agent_pos, world_state.payload_pos, scenario_state.goal_pos)
     
@@ -278,20 +298,14 @@ def reward_terms(world_state, scenario_state, training_progress, config) -> dict
     proximity_reward = proximity_coef * (
         scenario_state.prev_agent_payload_dist - curr_agent_payload_dist)
 
-    # PRIVATE: this agent's contact force on the payload, projected onto the
-    # goal direction and divided by stiffness so the unit is penetration depth.
-    # Zero with no overlap (cannot farm by hovering). Positive only when this
-    # contact would move the payload toward the goal; blocking from the front
-    # is negative. The second return of circle_box_dynamic_forces is the SUM
-    # over agents, (E, 2) -- Newton's third law on the per-agent force is the
-    # one that stays private.
-    force_on_agent, _ = circle_box_dynamic_forces(
-        world_state.agent_pos, world_state.agent_radius,
-        world_state.payload_pos, world_state.payload_halfsize, config.payload_stiffness)
-    goal_dir = scenario_state.goal_pos - world_state.payload_pos
-    goal_dir = goal_dir / goal_dir.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-    push = ((-force_on_agent) * goal_dir.unsqueeze(1)).sum(-1) / config.payload_stiffness
-    push_reward = config.push_coef * push
+    # PRIVATE: distance closed toward the standoff point behind the payload,
+    # the same point the scripted controller steers to. A delta, so hovering
+    # pays 0; unlike proximity the target is where a push actually helps.
+    curr_pushpoint_dist = agent_pushpoint_geometry(
+        world_state.agent_pos, world_state.payload_pos,
+        scenario_state.goal_pos, config.push_standoff)
+    push_reward = config.push_coef * (
+        scenario_state.prev_agent_pushpoint_dist - curr_pushpoint_dist)
 
     # PRIVATE: each agent's own distance to the predator. Zero beyond
     # predator_danger_radius, so this is "you are about to be hit", not a

@@ -218,11 +218,11 @@ def test_reset_at_no_environments_flagged_changes_nothing():
 
 
 def test_reset_at_masks_per_agent_shaping_baselines_by_environment():
-    """prev_agent_payload_dist and prev_alignment are (E, n_agents), the only
-    prev_ fields that are. reset_at has to mask them on the env axis, so a
-    (E,) mask would broadcast across agents instead and overwrite every
-    environment -- which reads as a free reward spike on the step after any
-    other environment in the batch resets.
+    """prev_agent_payload_dist, prev_alignment, and prev_agent_pushpoint_dist
+    are (E, n_agents), the only prev_ fields that are. reset_at has to mask
+    them on the env axis, so a (E,) mask would broadcast across agents instead
+    and overwrite every environment -- which reads as a free reward spike on
+    the step after any other environment in the batch resets.
     """
     config = make_test_config(num_envs=4)
     generator = torch.Generator().manual_seed(0)
@@ -231,28 +231,37 @@ def test_reset_at_masks_per_agent_shaping_baselines_by_environment():
     shape = (config.num_envs, config.n_agents)
     assert scenario_state.prev_agent_payload_dist.shape == shape
     assert scenario_state.prev_alignment.shape == shape
+    assert scenario_state.prev_agent_pushpoint_dist.shape == shape
 
     needs_reset = torch.tensor([True, False, True, False])
     new_world, new_scenario = scenario.reset_at(world_state, scenario_state, needs_reset, config, generator)
 
     assert new_scenario.prev_agent_payload_dist.shape == shape
     assert new_scenario.prev_alignment.shape == shape
+    assert new_scenario.prev_agent_pushpoint_dist.shape == shape
 
     for env_index in (1, 3):
         assert torch.equal(new_scenario.prev_agent_payload_dist[env_index],
                            scenario_state.prev_agent_payload_dist[env_index])
         assert torch.equal(new_scenario.prev_alignment[env_index],
                            scenario_state.prev_alignment[env_index])
+        assert torch.equal(new_scenario.prev_agent_pushpoint_dist[env_index],
+                           scenario_state.prev_agent_pushpoint_dist[env_index])
 
     # flagged environments get baselines matching their new spawn, so the first
     # step of the new episode scores a one-step delta rather than a jump
     expected_dist, expected_alignment = scenario.agent_payload_geometry(
         new_world.agent_pos, new_world.payload_pos, new_scenario.goal_pos)
+    expected_pushpoint = scenario.agent_pushpoint_geometry(
+        new_world.agent_pos, new_world.payload_pos, new_scenario.goal_pos,
+        config.push_standoff)
     for env_index in (0, 2):
         assert torch.allclose(new_scenario.prev_agent_payload_dist[env_index],
                               expected_dist[env_index], atol=1e-6)
         assert torch.allclose(new_scenario.prev_alignment[env_index],
                               expected_alignment[env_index], atol=1e-6)
+        assert torch.allclose(new_scenario.prev_agent_pushpoint_dist[env_index],
+                              expected_pushpoint[env_index], atol=1e-6)
 
 
 def test_shaping_terms_pay_for_improvement_not_position():
@@ -370,17 +379,17 @@ def test_threat_term_is_zero_outside_the_danger_radius_and_private():
     assert torch.allclose(threat, torch.zeros_like(threat), atol=1e-6)
 
 
-def test_push_reward_is_contact_and_signed_by_face():
-    """Hovering next to the payload pays nothing; only overlap that would move
-    it toward the goal is positive. The whole point of scoring penetration
-    along the goal direction rather than distance: a standing farm is 0, a
-    shove from behind is +, blocking from in front is -.
+def test_push_reward_pays_for_closing_on_the_standoff_point():
+    """Hovering at the standoff point pays nothing; closing in pays; backing
+    off costs the same amount. Same delta shape as proximity, different target:
+    the place a push actually helps, not the payload's center.
     """
     config = dataclasses.replace(
         make_test_config(num_envs=1, n_agents=1),
         progress_coef=0.0, time_penalty_coef=0.0, success_reward=0.0,
         proximity_coef_start=0.0, health_loss_coef=0.0, captured_reward=0.0,
         collision_coef=0.0, threat_coef=0.0, push_coef=8.0,
+        push_standoff=1.0,
     )
     generator = torch.Generator().manual_seed(0)
     world_state, scenario_state = scenario.reset(1, config, generator)
@@ -394,28 +403,33 @@ def test_push_reward_is_contact_and_signed_by_face():
     )
     scenario_state = dataclasses.replace(scenario_state, goal_pos=goal)
 
-    half = float(config.payload_halfsize[0])
-    standoff = half + config.agent_radius   # first contact on the x-face
+    # geometry sanity: payload origin, goal +x, standoff 1 -> push point at (-1, 0)
+    dist = scenario.agent_pushpoint_geometry(
+        torch.tensor([[[-1.0, 0.0]]]), payload, goal, config.push_standoff)
+    assert torch.allclose(dist, torch.zeros(1, 1), atol=1e-6)
 
-    # hovering just outside the trailing face: no overlap
-    hover = dataclasses.replace(
-        world_state, agent_pos=torch.tensor([[[-standoff - 0.05, 0.0]]]))
+    start = torch.tensor([[[-2.0, 0.0]]])
+    scenario_state = dataclasses.replace(
+        scenario_state,
+        prev_agent_pushpoint_dist=scenario.agent_pushpoint_geometry(
+            start, payload, goal, config.push_standoff),
+    )
+
+    hover = dataclasses.replace(world_state, agent_pos=start)
     assert torch.allclose(
         scenario.reward_terms(hover, scenario_state, 0.0, config)["push"],
         torch.zeros(1, 1), atol=1e-6)
 
-    # 0.05 of penetration on the trailing (-x) face: contact pushes +x
-    behind = dataclasses.replace(
-        world_state, agent_pos=torch.tensor([[[-standoff + 0.05, 0.0]]]))
-    push_behind = scenario.reward_terms(behind, scenario_state, 0.0, config)["push"]
-    assert (push_behind > 0).all()
+    toward = dataclasses.replace(
+        world_state, agent_pos=torch.tensor([[[-1.5, 0.0]]]))
+    push_toward = scenario.reward_terms(toward, scenario_state, 0.0, config)["push"]
+    assert (push_toward > 0).all()
 
-    # same penetration on the leading (+x) face: contact pushes -x
-    ahead = dataclasses.replace(
-        world_state, agent_pos=torch.tensor([[[standoff - 0.05, 0.0]]]))
-    push_ahead = scenario.reward_terms(ahead, scenario_state, 0.0, config)["push"]
-    assert (push_ahead < 0).all()
-    assert torch.allclose(push_behind, -push_ahead, atol=1e-5)
+    away = dataclasses.replace(
+        world_state, agent_pos=torch.tensor([[[-2.5, 0.0]]]))
+    push_away = scenario.reward_terms(away, scenario_state, 0.0, config)["push"]
+    assert (push_away < 0).all()
+    assert torch.allclose(push_toward, -push_away, atol=1e-5)
 
 
 def test_threat_is_silent_while_the_predator_is_on_cooldown():

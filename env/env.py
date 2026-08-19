@@ -17,7 +17,8 @@ import dataclasses
 7. build the info dict from the pre-reset state
 8. scenario.reset_at()        -> respawn the environments that finished
 9. dataclasses.replace on scenario_state to advance step_count and re-baseline
-   the shaping terms: prev_payload_dist, prev_agent_payload_dist, prev_alignment
+   the shaping terms: prev_payload_dist, prev_agent_payload_dist, prev_alignment,
+   prev_agent_pushpoint_dist
 10. scenario.observe()        -> the observation actually returned, post-reset
 """
 
@@ -70,7 +71,17 @@ class Env:
         current_payload_dist = torch.norm(self.world_state.payload_pos - self.scenario_state.goal_pos , dim=-1)
         current_agent_payload_dist, current_alignment = scenario.agent_payload_geometry(
             self.world_state.agent_pos, self.world_state.payload_pos, self.scenario_state.goal_pos)
-        self.scenario_state = dataclasses.replace(self.scenario_state, step_count=self.scenario_state.step_count + 1, prev_payload_dist=current_payload_dist, prev_agent_payload_dist=current_agent_payload_dist, prev_alignment=current_alignment)
+        current_agent_pushpoint_dist = scenario.agent_pushpoint_geometry(
+            self.world_state.agent_pos, self.world_state.payload_pos,
+            self.scenario_state.goal_pos, self.config.push_standoff)
+        self.scenario_state = dataclasses.replace(
+            self.scenario_state,
+            step_count=self.scenario_state.step_count + 1,
+            prev_payload_dist=current_payload_dist,
+            prev_agent_payload_dist=current_agent_payload_dist,
+            prev_alignment=current_alignment,
+            prev_agent_pushpoint_dist=current_agent_pushpoint_dist,
+        )
         
         # observed AFTER reset_at, so what a rollout loop carries into the next
         # step matches the state the simulation is actually in. Returning the

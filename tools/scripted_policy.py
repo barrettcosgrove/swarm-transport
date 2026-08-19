@@ -18,8 +18,7 @@ def scripted_policy(world_state, scenario_state, config):
     goal_dir = to_goal / torch.clamp(torch.norm(to_goal, dim=-1, keepdim=True), min=1e-6)
 
     # ---- the staging point behind the payload ----
-    standoff = config.payload_halfsize.max() + config.agent_radius + 0.15
-    push_point = payload_pos - goal_dir * standoff          # (E, 1, 2)
+    push_point = payload_pos - goal_dir * config.push_standoff          # (E, 1, 2)
 
     # ---- which mode is each agent in? ----
     to_push_point = push_point - agent_pos                  # (E, N, 2)

@@ -175,13 +175,16 @@ class Config:
     # never came off and proximity and alignment went on pulling all n_agents
     # onto the same single point behind the payload for the whole run.
     proximity_anneal_fraction: float = 0.6
-    # Per-unit penetration of this agent's contact, projected onto the payload's
-    # direction to the goal. The private credit assignment that shared progress
-    # cannot provide: hovering pays 0, shoving from behind pays, blocking from
-    # in front costs. Does not anneal -- pushing is the task, same as progress.
-    # 8.0 makes a 0.05-unit overlap on the correct face worth +0.4/step, 4x
-    # the time penalty.
+    # Per-unit distance closed toward the standoff point behind the payload.
+    # Same shape as proximity, different target: payload center vs the place a
+    # push actually helps. Hovering pays 0. Does not anneal -- pushing is the
+    # task, same as progress. 8.0 matches proximity_coef_start, so a 0.05-unit
+    # close-in is +0.4/step, 4x the time penalty.
     push_coef: float = 8.0
+    # Staging offset behind the payload, along the payload->goal line. Default is
+    # payload_halfsize.max() + agent_radius + 0.15, the same number the scripted
+    # controller already used inline.
+    push_standoff: float = 0.45
     # Kept so the anneal invariant still has something to check, but no longer
     # consumed by compute_reward: a telescoping cosine summed to ~0 over a run
     # and could not teach a standing push. That job is push_coef above.
