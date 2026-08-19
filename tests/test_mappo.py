@@ -98,7 +98,7 @@ def test_one_iteration_produces_the_expected_shapes():
 
     assert {"episodes_completed", "success_rate", "capture_rate", "timeout_rate"} <= set(outcomes)
     for key in ("mean_episode_length", "mean_team_spread", "mean_min_predator_dist",
-                "reward_progress", "reward_health", "reward_threat"):
+                "reward_progress", "reward_health", "reward_threat", "reward_push"):
         assert key in outcomes, f"outcomes is missing {key}"
 
 

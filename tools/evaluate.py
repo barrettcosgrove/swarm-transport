@@ -16,7 +16,7 @@ confirmation that health has become a predictable budget rather than a lottery.
 
 Usage:
     from tools.evaluate import evaluate, format_report
-    print(format_report(evaluate(config, scripted_policy)))
+    print(format_report(evaluate(config, policy)))
 
     python -m tools.evaluate
 """
@@ -124,9 +124,22 @@ def format_report(result, label=""):
 
 
 if __name__ == "__main__":
+    from env import scenario
     from train.config import Config
-    from tools.scripted_policy import scripted_policy
+    from train.checkpoints import load_checkpoint
+    from train.mappo import Actor, Critic
+
+    CHECKPOINT = "train/checkpoints/preview_100_push_reward/checkpoint_100.pt"
 
     config = Config(num_envs=16)
+    actor = Actor(config.obs_dim, 2, config.hidden_dim)
+    critic = Critic(config.obs_dim, config.n_agents, config.hidden_dim)
+    load_checkpoint(CHECKPOINT, actor, critic)
+    actor.eval()
+
+    def actor_policy(world_state, scenario_state, cfg):
+        with torch.no_grad():
+            return actor(scenario.observe(world_state, scenario_state, cfg)).clamp(-1.0, 1.0)
+
     print(HEADER)
-    print(format_report(evaluate(config, scripted_policy), "current config"))
+    print(format_report(evaluate(config, actor_policy), "preview_100_push_reward"))

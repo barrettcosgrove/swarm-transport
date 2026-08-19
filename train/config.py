@@ -74,7 +74,12 @@ class Config:
     # top speed is thrust/drag = 14, four times the nominal value this used to
     # carry, and the predator covers 0.7 units per step against a 0.25 contact
     # distance -- deep enough to one-shot an agent, or skip clean over one.
-    predator_max_speed: float = 6.0
+    #
+    # 3.5 rather than 6.0 so a thrusting agent can break contact during the
+    # cooldown window. At 6.0 it closed 0.3 units/step and ran down a clump
+    # that had not yet learned to thrust; fleeing was not a behaviour the
+    # policy could express, only a penalty it absorbed.
+    predator_max_speed: float = 3.5
     predator_max_thrust: float = 3.5
     # how close an agent has to be to take damage. Larger than the bodies
     # actually touching (agent_radius + predator_radius = 0.25) so contact is
@@ -170,18 +175,16 @@ class Config:
     # never came off and proximity and alignment went on pulling all n_agents
     # onto the same single point behind the payload for the whole run.
     proximity_anneal_fraction: float = 0.6
-    # Pays for standing on the far side of the payload from the goal, where a
-    # push actually moves it where it needs to go. Proximity says "get close"
-    # and is indifferent about which side you close in on, so the two are
-    # separate terms.
-    #
-    # Scored on a cosine, so the coefficient IS the per-step magnitude at best
-    # alignment. Kept near the time penalty rather than near proximity: this
-    # only orients agents that are already converging, and a large signed term
-    # would make the wrong side of the payload cost more than wasting a step.
-    # Annealed on the same reasoning as proximity -- a hint about where to be
-    # while progress is too sparse to learn from, removed once pushing works,
-    # which is also what stops agents from orbiting to farm the cosine.
+    # Per-unit penetration of this agent's contact, projected onto the payload's
+    # direction to the goal. The private credit assignment that shared progress
+    # cannot provide: hovering pays 0, shoving from behind pays, blocking from
+    # in front costs. Does not anneal -- pushing is the task, same as progress.
+    # 8.0 makes a 0.05-unit overlap on the correct face worth +0.4/step, 4x
+    # the time penalty.
+    push_coef: float = 8.0
+    # Kept so the anneal invariant still has something to check, but no longer
+    # consumed by compute_reward: a telescoping cosine summed to ~0 over a run
+    # and could not teach a standing push. That job is push_coef above.
     alignment_coef_start: float = 8.0
     alignment_anneal_fraction: float = 0.6
     health_loss_coef: float = 1.0
@@ -219,10 +222,10 @@ class Config:
     # it fires only when contact is imminent and leaves ordinary pushing alone.
     predator_danger_radius: float = 1.0
     # per-step cost at zero distance, falling quadratically to zero at the
-    # radius. 0.3 is 3x the time penalty, and over one cooldown window costs
-    # about the same as one damage event's private share -- the two evasion
-    # signals are meant to be comparable, not for one to drown the other.
-    threat_coef: float = 0.3
+    # radius, and only while the predator can actually deal damage. Matched
+    # to the time penalty so it is a reason to step away, not the dominant
+    # private term that made approaching the guarded payload net-negative.
+    threat_coef: float = 0.10
     # 15 events at 40 steps each = 600 steps of life, against ~340 for a
     # traversal. At 100 the budget was 260 and arrival was impossible.
     max_health: float = 150.0

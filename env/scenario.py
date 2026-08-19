@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 import torch
 from .world import WorldState
-from .physics import circle_box_static_forces
+from .physics import circle_box_static_forces, circle_box_dynamic_forces
 import math 
 import dataclasses
 
@@ -266,35 +266,47 @@ def reward_terms(world_state, scenario_state, training_progress, config) -> dict
     success = curr_payload_dist < config.success_threshold
     success_reward = (success.float() * config.success_reward).unsqueeze(1).expand(E, config.n_agents)
     
-    # Both per-agent terms are scored on the step's improvement, not on the
-    # standing value -- the same shape as progress_reward above, one level down.
-    # A difference telescopes: over an episode the sum is only ever
-    # (initial - final), whatever route was taken in between. So holding
-    # position beside the payload pays nothing, and orbiting to farm the cosine
-    # gives back on the way out exactly what it collected on the way in. The
-    # absolute form paid every step for a state already reached, which is what
-    # made both farmable in the first place.
-    curr_agent_payload_dist, curr_alignment = agent_payload_geometry(
+    # Proximity stays a delta: it pays for closing in from spawn, then nothing
+    # once you have arrived, so it cannot be farmed by hovering. Alignment used
+    # to be the same shape and summed to ~0 over a run -- telescoping cannot
+    # teach a standing push. That job moves to push_reward below.
+    curr_agent_payload_dist, _ = agent_payload_geometry(
         world_state.agent_pos, world_state.payload_pos, scenario_state.goal_pos)
     
     proximity_anneal = min(training_progress / config.proximity_anneal_fraction, 1.0)
     proximity_coef = config.proximity_coef_start * (1 - proximity_anneal)
     proximity_reward = proximity_coef * (
         scenario_state.prev_agent_payload_dist - curr_agent_payload_dist)
-    
-    alignment_anneal = min(training_progress / config.alignment_anneal_fraction, 1.0)
-    alignment_coef = config.alignment_coef_start * (1 - alignment_anneal)
-    alignment_reward = alignment_coef * (curr_alignment - scenario_state.prev_alignment)
+
+    # PRIVATE: this agent's contact force on the payload, projected onto the
+    # goal direction and divided by stiffness so the unit is penetration depth.
+    # Zero with no overlap (cannot farm by hovering). Positive only when this
+    # contact would move the payload toward the goal; blocking from the front
+    # is negative. The second return of circle_box_dynamic_forces is the SUM
+    # over agents, (E, 2) -- Newton's third law on the per-agent force is the
+    # one that stays private.
+    force_on_agent, _ = circle_box_dynamic_forces(
+        world_state.agent_pos, world_state.agent_radius,
+        world_state.payload_pos, world_state.payload_halfsize, config.payload_stiffness)
+    goal_dir = scenario_state.goal_pos - world_state.payload_pos
+    goal_dir = goal_dir / goal_dir.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+    push = ((-force_on_agent) * goal_dir.unsqueeze(1)).sum(-1) / config.payload_stiffness
+    push_reward = config.push_coef * push
 
     # PRIVATE: each agent's own distance to the predator. Zero beyond
     # predator_danger_radius, so this is "you are about to be hit", not a
     # standing reason to avoid the payload the predator guards. Squared so
     # both the value and its derivative vanish at the boundary.
+    #
+    # Gated on cooldown: a cooling predator cannot deal damage, and billing
+    # threat through that window taught agents to freeze next to a harmless
+    # hunter instead of using the 40 steps to push.
     dist_to_predator = torch.norm(
         world_state.agent_pos - world_state.predator_pos.unsqueeze(1), dim=-1)
     intrusion = ((config.predator_danger_radius - dist_to_predator)
                  .clamp(min=0.0) / config.predator_danger_radius)
-    threat_reward = -config.threat_coef * intrusion.pow(2)
+    live = (scenario_state.predator_cooldown <= 0).unsqueeze(1)
+    threat_reward = -config.threat_coef * intrusion.pow(2) * live
 
     # SHARED + PRIVATE: update_health drains a flat health_loss_per_step on
     # any() over agents, so the pool itself does not know who was hit. This
@@ -328,7 +340,7 @@ def reward_terms(world_state, scenario_state, training_progress, config) -> dict
         "time": time_penalty,
         "success": success_reward,
         "proximity": proximity_reward,
-        "alignment": alignment_reward,
+        "push": push_reward,
         "health": health_loss_reward,
         "captured": captured_reward,
         "collision": collision_reward,

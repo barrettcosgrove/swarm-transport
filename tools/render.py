@@ -15,10 +15,11 @@ with different visual settings without re-running any physics.
 
 Usage:
     from tools.render import record_episode, render_to_gif
-    from tools.scripted_policy import scripted_policy
 
-    frames = record_episode(env, scripted_policy, n_steps=250)
+    frames = record_episode(env, policy, n_steps=250)
     render_to_gif(frames, "outputs/rollout.gif", config, fps=20, every=2)
+
+    python -m tools.render
 """
 import os
 from dataclasses import dataclass
@@ -412,11 +413,24 @@ def render_to_gif(frames, output_path, config, fps=20, every=1, n_panels=4, hold
 
 if __name__ == "__main__":
     from env.env import Env
+    from env import scenario
     from train.config import Config
-    from tools.scripted_policy import scripted_policy
+    from train.checkpoints import load_checkpoint
+    from train.mappo import Actor, Critic
+
+    CHECKPOINT = "train/checkpoints/preview_100_push_reward/checkpoint_100.pt"
 
     config = Config(num_envs=4)
+    actor = Actor(config.obs_dim, 2, config.hidden_dim)
+    critic = Critic(config.obs_dim, config.n_agents, config.hidden_dim)
+    load_checkpoint(CHECKPOINT, actor, critic)
+    actor.eval()
+
+    def actor_policy(world_state, scenario_state, cfg):
+        with torch.no_grad():
+            return actor(scenario.observe(world_state, scenario_state, cfg)).clamp(-1.0, 1.0)
+
     env = Env(config)
-    frames = record_episode(env, scripted_policy, n_steps=config.max_steps)
-    path = render_to_gif(frames, "outputs/scripted_rollout.gif", config, fps=8, every=2, hold_seconds=1.5)
+    frames = record_episode(env, actor_policy, n_steps=config.max_steps)
+    path = render_to_gif(frames, "outputs/actor_rollout.gif", config, fps=8, every=2, hold_seconds=1.5)
     print(f"wrote {path}")

@@ -267,7 +267,7 @@ def test_shaping_terms_pay_for_improvement_not_position():
         make_test_config(num_envs=1, n_agents=1),
         progress_coef=0.0, time_penalty_coef=0.0, success_reward=0.0,
         health_loss_coef=0.0, captured_reward=0.0, collision_coef=0.0,
-        threat_coef=0.0,
+        threat_coef=0.0, push_coef=0.0,
     )
     generator = torch.Generator().manual_seed(0)
     world_state, scenario_state = scenario.reset(1, config, generator)
@@ -296,6 +296,7 @@ def test_health_loss_blame_falls_on_the_agent_in_range():
         progress_coef=0.0, time_penalty_coef=0.0, success_reward=0.0,
         proximity_coef_start=0.0, alignment_coef_start=0.0,
         captured_reward=0.0, collision_coef=0.0, threat_coef=0.0,
+        push_coef=0.0,
         health_loss_coef=1.0, health_loss_blame_fraction=0.7,
         health_loss_per_step=10.0,
     )
@@ -346,7 +347,7 @@ def test_threat_term_is_zero_outside_the_danger_radius_and_private():
         progress_coef=0.0, time_penalty_coef=0.0, success_reward=0.0,
         proximity_coef_start=0.0, alignment_coef_start=0.0,
         health_loss_coef=0.0, captured_reward=0.0, collision_coef=0.0,
-        threat_coef=0.3, predator_danger_radius=1.0,
+        threat_coef=0.3, predator_danger_radius=1.0, push_coef=0.0,
     )
     generator = torch.Generator().manual_seed(0)
     world_state, scenario_state = scenario.reset(1, config, generator)
@@ -367,6 +368,85 @@ def test_threat_term_is_zero_outside_the_danger_radius_and_private():
     world_state = dataclasses.replace(world_state, agent_pos=agent_pos)
     threat = scenario.reward_terms(world_state, scenario_state, 0.0, config)["threat"]
     assert torch.allclose(threat, torch.zeros_like(threat), atol=1e-6)
+
+
+def test_push_reward_is_contact_and_signed_by_face():
+    """Hovering next to the payload pays nothing; only overlap that would move
+    it toward the goal is positive. The whole point of scoring penetration
+    along the goal direction rather than distance: a standing farm is 0, a
+    shove from behind is +, blocking from in front is -.
+    """
+    config = dataclasses.replace(
+        make_test_config(num_envs=1, n_agents=1),
+        progress_coef=0.0, time_penalty_coef=0.0, success_reward=0.0,
+        proximity_coef_start=0.0, health_loss_coef=0.0, captured_reward=0.0,
+        collision_coef=0.0, threat_coef=0.0, push_coef=8.0,
+    )
+    generator = torch.Generator().manual_seed(0)
+    world_state, scenario_state = scenario.reset(1, config, generator)
+
+    payload = torch.tensor([[0.0, 0.0]])
+    goal = torch.tensor([[5.0, 0.0]])
+    world_state = dataclasses.replace(
+        world_state, payload_pos=payload,
+        predator_pos=torch.tensor([[50.0, 50.0]]),
+        obstacle_center=torch.full_like(world_state.obstacle_center, 1e6),
+    )
+    scenario_state = dataclasses.replace(scenario_state, goal_pos=goal)
+
+    half = float(config.payload_halfsize[0])
+    standoff = half + config.agent_radius   # first contact on the x-face
+
+    # hovering just outside the trailing face: no overlap
+    hover = dataclasses.replace(
+        world_state, agent_pos=torch.tensor([[[-standoff - 0.05, 0.0]]]))
+    assert torch.allclose(
+        scenario.reward_terms(hover, scenario_state, 0.0, config)["push"],
+        torch.zeros(1, 1), atol=1e-6)
+
+    # 0.05 of penetration on the trailing (-x) face: contact pushes +x
+    behind = dataclasses.replace(
+        world_state, agent_pos=torch.tensor([[[-standoff + 0.05, 0.0]]]))
+    push_behind = scenario.reward_terms(behind, scenario_state, 0.0, config)["push"]
+    assert (push_behind > 0).all()
+
+    # same penetration on the leading (+x) face: contact pushes -x
+    ahead = dataclasses.replace(
+        world_state, agent_pos=torch.tensor([[[standoff - 0.05, 0.0]]]))
+    push_ahead = scenario.reward_terms(ahead, scenario_state, 0.0, config)["push"]
+    assert (push_ahead < 0).all()
+    assert torch.allclose(push_behind, -push_ahead, atol=1e-5)
+
+
+def test_threat_is_silent_while_the_predator_is_on_cooldown():
+    """A cooling predator cannot deal damage. Billing threat through that
+    window taught agents to freeze next to a harmless hunter. The term has
+    to be identically zero whenever cooldown > 0, even at zero distance.
+    """
+    config = dataclasses.replace(
+        make_test_config(num_envs=1, n_agents=1),
+        progress_coef=0.0, time_penalty_coef=0.0, success_reward=0.0,
+        proximity_coef_start=0.0, health_loss_coef=0.0, captured_reward=0.0,
+        collision_coef=0.0, threat_coef=0.10, predator_danger_radius=1.0,
+        push_coef=0.0,
+    )
+    generator = torch.Generator().manual_seed(0)
+    world_state, scenario_state = scenario.reset(1, config, generator)
+    world_state = dataclasses.replace(
+        world_state,
+        agent_pos=world_state.predator_pos.unsqueeze(1).clone(),
+        payload_pos=world_state.predator_pos + 50.0,
+    )
+
+    cooling = dataclasses.replace(
+        scenario_state, predator_cooldown=torch.tensor([10.0]))
+    threat = scenario.reward_terms(world_state, cooling, 0.0, config)["threat"]
+    assert torch.allclose(threat, torch.zeros_like(threat), atol=1e-6)
+
+    live = dataclasses.replace(
+        scenario_state, predator_cooldown=torch.zeros(1))
+    threat = scenario.reward_terms(world_state, live, 0.0, config)["threat"]
+    assert torch.allclose(threat, torch.tensor([[-config.threat_coef]]), atol=1e-5)
 
 
 # ---------------------------------------------------------------- obstacle spawn invariants
