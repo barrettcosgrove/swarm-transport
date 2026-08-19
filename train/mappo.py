@@ -394,6 +394,8 @@ class TrainingLogger:
                 f"return {record['mean_episode_return']:>8.2f}  "
                 f"succ {record['success_rate']:>5.1%}  "
                 f"cap {record['capture_rate']:>5.1%}  "
+                f"to {record['timeout_rate']:>5.1%}  "
+                f"len {record['mean_episode_length']:>6.0f}  "
                 f"pi {record['policy_loss']:>7.4f}  "
                 f"v {record['value_loss']:>9.3f}  "
                 f"ent {record['entropy']:>6.3f}  "
@@ -447,6 +449,12 @@ class MAPPOTrainer:
         # single episode spans about seven iterations
         self.episode_return = torch.zeros(config.num_envs, device=self.device)
         self.episode_returns = deque(maxlen=100)
+        self.episode_length = torch.zeros(config.num_envs, device=self.device)
+        self.episode_lengths = deque(maxlen=100)
+        # filled on the first collect_rollout from info["reward_terms"] keys,
+        # so adding a term does not require a matching edit here
+        self.episode_term_return = None
+        self.episode_term_returns = None
 
     # ------------------------------------------------------------ rollout
 
@@ -460,6 +468,8 @@ class MAPPOTrainer:
         self.buffer.clear()
         N = self.config.n_agents
         successes = captures = timeouts = episodes = 0
+        spread_sum = pred_sum = 0.0
+        n_beh_steps = 0
 
         for step in range(self.config.rollout_steps):
             with torch.no_grad():
@@ -489,12 +499,40 @@ class MAPPOTrainer:
                         final_values = self.value_normalizer.denormalize(final_values)
                 self.buffer.trunc_values[step][trunc_n] = final_values[trunc_n]
 
+            terms = info["reward_terms"]
+            if self.episode_term_return is None:
+                self.episode_term_return = {k: torch.zeros(self.config.num_envs, device=self.device)
+                                            for k in terms}
+                self.episode_term_returns = {k: deque(maxlen=100) for k in terms}
+            for name, term in terms.items():
+                self.episode_term_return[name] += term.mean(-1)
+
+            # per-step behavioural diagnostics: team spread and predator
+            # distance distinguish "learning to evade" from "learning to quit",
+            # and neither is visible in the return
+            ws = info["world_state"]
+            centroid = ws.agent_pos.mean(dim=1, keepdim=True)
+            spread_sum += (ws.agent_pos - centroid).norm(dim=-1).mean().item()
+            pred_dist = (ws.agent_pos - ws.predator_pos.unsqueeze(1)).norm(dim=-1)
+            pred_sum += pred_dist.min(dim=-1).values.mean().item()
+            n_beh_steps += 1
+
             self.episode_return += reward.mean(-1)
+            self.episode_length += 1
             done = terminated | truncated
             if done.any():
                 self.episode_returns.extend(self.episode_return[done].tolist())
+                self.episode_lengths.extend(self.episode_length[done].tolist())
                 self.episode_return = torch.where(done, torch.zeros_like(self.episode_return),
                                                   self.episode_return)
+                self.episode_length = torch.where(done, torch.zeros_like(self.episode_length),
+                                                  self.episode_length)
+                for name in self.episode_term_return:
+                    self.episode_term_returns[name].extend(
+                        self.episode_term_return[name][done].tolist())
+                    self.episode_term_return[name] = torch.where(
+                        done, torch.zeros_like(self.episode_term_return[name]),
+                        self.episode_term_return[name])
                 # outcomes come from info, not from reward: a return of +90 is
                 # not distinguishable from a timeout that happened to go well
                 successes += int((terminated & info["success"]).sum())
@@ -510,12 +548,21 @@ class MAPPOTrainer:
             if self.value_normalizer is not None:
                 last_value = self.value_normalizer.denormalize(last_value)
 
+        def _mean(values):
+            return sum(values) / len(values) if values else 0.0
+
         outcomes = {
             "episodes_completed": episodes,
             "success_rate": successes / episodes if episodes else 0.0,
             "capture_rate": captures / episodes if episodes else 0.0,
             "timeout_rate": timeouts / episodes if episodes else 0.0,
+            "mean_episode_length": _mean(self.episode_lengths),
+            "mean_team_spread": spread_sum / n_beh_steps,
+            "mean_min_predator_dist": pred_sum / n_beh_steps,
         }
+        if self.episode_term_returns is not None:
+            for name, values in self.episode_term_returns.items():
+                outcomes[f"reward_{name}"] = _mean(values)
         return last_value, outcomes
 
     # ------------------------------------------------------------ update

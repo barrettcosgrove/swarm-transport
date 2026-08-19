@@ -96,7 +96,10 @@ def test_one_iteration_produces_the_expected_shapes():
     for name in ("log_probs", "advantages", "returns"):
         assert flat[name].shape == (rows,), f"flat[{name}] has the wrong shape"
 
-    assert set(outcomes) == {"episodes_completed", "success_rate", "capture_rate", "timeout_rate"}
+    assert {"episodes_completed", "success_rate", "capture_rate", "timeout_rate"} <= set(outcomes)
+    for key in ("mean_episode_length", "mean_team_spread", "mean_min_predator_dist",
+                "reward_progress", "reward_health", "reward_threat"):
+        assert key in outcomes, f"outcomes is missing {key}"
 
 
 def test_actor_never_sees_more_than_its_own_observation():

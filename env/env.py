@@ -16,7 +16,8 @@ import dataclasses
 6. scenario.observe()         -> the pre-reset observation, kept in info
 7. build the info dict from the pre-reset state
 8. scenario.reset_at()        -> respawn the environments that finished
-9. dataclasses.replace on scenario_state to advance step_count and prev_payload_dist
+9. dataclasses.replace on scenario_state to advance step_count and re-baseline
+   the shaping terms: prev_payload_dist, prev_agent_payload_dist, prev_alignment
 10. scenario.observe()        -> the observation actually returned, post-reset
 """
 
@@ -38,7 +39,8 @@ class Env:
         self.world_state = physics.step(self.world_state, agent_action, predator_action, self.config.dt, self.config.agent_max_thrust, self.config.predator_max_thrust, self.config.agent_drag_coef, self.config.predator_drag_coef, self.config.payload_drag_coef, self.config.body_stiffness, self.config.wall_stiffness, self.config.obstacle_stiffness, self.config.payload_stiffness, predator_max_speed, agent_max_speed=self.config.agent_max_speed)
         self.scenario_state = scenario.update_health(self.world_state, self.scenario_state, self.config)
         
-        reward = scenario.compute_reward(self.world_state, self.scenario_state, training_progress, self.config)
+        terms = scenario.reward_terms(self.world_state, self.scenario_state, training_progress, self.config)
+        reward = torch.stack(tuple(terms.values())).sum(0)
         terminated, truncated = scenario.compute_done(self.world_state, self.scenario_state, self.config)
         needs_reset = terminated | truncated
         final_observation = scenario.observe(self.world_state, self.scenario_state, self.config)
@@ -50,6 +52,7 @@ class Env:
             "captured": self.scenario_state.health <= 0.0,
             "world_state": self.world_state,
             "scenario_state": self.scenario_state,
+            "reward_terms": terms,
             # the last observation of the episode that just ended. GAE has to
             # bootstrap a truncated episode from the value of where it actually
             # stopped, which the returned observation no longer describes.
@@ -65,7 +68,9 @@ class Env:
         # compute_done and the renderer both read step_count under this
         # convention, and moving the increment would shift truncation by a step.
         current_payload_dist = torch.norm(self.world_state.payload_pos - self.scenario_state.goal_pos , dim=-1)
-        self.scenario_state = dataclasses.replace(self.scenario_state, step_count=self.scenario_state.step_count + 1, prev_payload_dist=current_payload_dist)
+        current_agent_payload_dist, current_alignment = scenario.agent_payload_geometry(
+            self.world_state.agent_pos, self.world_state.payload_pos, self.scenario_state.goal_pos)
+        self.scenario_state = dataclasses.replace(self.scenario_state, step_count=self.scenario_state.step_count + 1, prev_payload_dist=current_payload_dist, prev_agent_payload_dist=current_agent_payload_dist, prev_alignment=current_alignment)
         
         # observed AFTER reset_at, so what a rollout loop carries into the next
         # step matches the state the simulation is actually in. Returning the

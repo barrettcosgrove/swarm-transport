@@ -13,6 +13,10 @@ class ScenarioState:
     step_count: torch.Tensor          # (E,)
     predator_cooldown: torch.Tensor   # (E,)
     prev_payload_dist: torch.Tensor   # (E,)
+    # per-agent, unlike every other prev_ field here: the shaping terms they
+    # feed are private to each agent
+    prev_agent_payload_dist: torch.Tensor   # (E, n_agents)
+    prev_alignment: torch.Tensor            # (E, n_agents)
     predator_noise: torch.Tensor      # (E, 2)
     predator_target: torch.Tensor     # (E,) long -- agent the predator is committed to
     predator_retarget_timer: torch.Tensor  # (E,) steps left before it may reconsider
@@ -106,6 +110,8 @@ def reset(num_envs, config, generator) -> (WorldState, ScenarioState):
         obstacle_active=config.obstacle_active.expand(E, -1),
     )
 
+    agent_payload_dist, alignment = agent_payload_geometry(agent_pos, payload_pos, goal_pos)
+
     scenario_state = ScenarioState(
         goal_pos=goal_pos,
         health=torch.full((E,), config.max_health, device=dev),
@@ -113,6 +119,10 @@ def reset(num_envs, config, generator) -> (WorldState, ScenarioState):
         step_count=torch.zeros(E, dtype=torch.long, device=dev),
         predator_cooldown=torch.zeros(E, device=dev),
         prev_payload_dist=torch.norm(payload_pos - goal_pos, dim=-1),
+        # seeded from the spawn state, so the first step of an episode scores a
+        # real one-step delta rather than a jump from zero
+        prev_agent_payload_dist=agent_payload_dist,
+        prev_alignment=alignment,
         predator_noise=torch.zeros(E, 2, device=dev),
         # timer at zero so the first step picks a target normally
         predator_target=torch.zeros(E, dtype=torch.long, device=dev),
@@ -144,6 +154,10 @@ def reset_at(world_state, scenario_state, needs_reset, config, generator) -> tup
         step_count=torch.where(mask1, fresh_scenario.step_count, scenario_state.step_count),
         predator_cooldown=torch.where(mask1, fresh_scenario.predator_cooldown, scenario_state.predator_cooldown),
         prev_payload_dist=torch.where(mask1, fresh_scenario.prev_payload_dist, scenario_state.prev_payload_dist),
+        # mask2, not mask1: these are (E, n_agents), so a bare (E,) mask would
+        # broadcast across the agent axis instead of the env axis
+        prev_agent_payload_dist=torch.where(mask2, fresh_scenario.prev_agent_payload_dist, scenario_state.prev_agent_payload_dist),
+        prev_alignment=torch.where(mask2, fresh_scenario.prev_alignment, scenario_state.prev_alignment),
         prev_health=torch.where(mask1, fresh_scenario.prev_health, scenario_state.prev_health),
         predator_noise=torch.where(mask2, fresh_scenario.predator_noise, scenario_state.predator_noise),
         predator_target=torch.where(mask1, fresh_scenario.predator_target, scenario_state.predator_target),
@@ -201,9 +215,47 @@ def observe(world_state, scenario_state, config) -> torch.Tensor:
     obs = torch.cat([own_pos, own_vel, goal_offset, payload_offset, payload_rel_vel, rel_pos_other_agents, rel_vel_other_agents, time_remaining, predator_offset, predator_rel_vel, shared_health], dim=-1)
     return obs
 
-def compute_reward(world_state, scenario_state, training_progress, config) -> torch.Tensor:   # (E, n_agents)
+def agent_payload_geometry(agent_pos, payload_pos, goal_pos) -> tuple[torch.Tensor, torch.Tensor]:
+    """(E, n_agents) agent-to-payload distance, and the cosine between "which
+    way does this agent face the payload" and "which way does the payload have
+    to travel".
+
+    The two quantities the per-agent shaping terms are built from. Shared by
+    reset, compute_reward and env.step rather than written out at each site:
+    the shaping is a difference between this step's values and last step's, so
+    a discrepancy between how the two ends are measured would show up as a
+    reward the agent cannot influence.
+
+    Alignment is +1 directly behind the payload, the one place a push helps,
+    and -1 in the payload's path. A direction, not a position, so it is
+    scale-free: it says nothing about closing in, which is the distance's job.
+    """
+    agent_to_payload = payload_pos.unsqueeze(1) - agent_pos
+    dist = agent_to_payload.norm(dim=-1)
+    agent_to_payload_dir = agent_to_payload / dist.unsqueeze(-1).clamp(min=1e-6)
+    goal_dir = goal_pos - payload_pos
+    goal_dir = (goal_dir / goal_dir.norm(dim=-1, keepdim=True).clamp(min=1e-6)).unsqueeze(1)
+    return dist, (agent_to_payload_dir * goal_dir).sum(-1)
+
+
+def reward_terms(world_state, scenario_state, training_progress, config) -> dict[str, torch.Tensor]:
+    """Every reward component separately, each (E, n_agents), keyed by name.
+
+    compute_reward is the sum of these. Split apart because the totals hide the
+    thing you need when a policy misbehaves: a run whose return sits at -400
+    could be paying for the clock, for damage, or for shoving the payload the
+    wrong way, and those call for opposite fixes. Diagnosing the camping/suicide
+    failure took a throwaway script to recover numbers this function returns for
+    free, and train/mappo.py now logs them per iteration.
+
+    Which terms are private to an agent and which are shared across the team is
+    the load-bearing distinction here, so it is called out per term below. A
+    shared term is identical for all n_agents, so an individual's action barely
+    moves it, and the policy gradient largely ignores it.
+    """
     E = world_state.agent_pos.shape[0]
-    
+    dev = world_state.agent_pos.device
+
     curr_payload_dist = torch.norm(world_state.payload_pos - scenario_state.goal_pos, dim=-1)
     progress = scenario_state.prev_payload_dist - curr_payload_dist
     progress_reward = (config.progress_coef * progress).unsqueeze(1).expand(E, config.n_agents)
@@ -214,41 +266,79 @@ def compute_reward(world_state, scenario_state, training_progress, config) -> to
     success = curr_payload_dist < config.success_threshold
     success_reward = (success.float() * config.success_reward).unsqueeze(1).expand(E, config.n_agents)
     
-    agent_to_payload = world_state.payload_pos.unsqueeze(1) - world_state.agent_pos
-    dist_agent_to_payload = torch.norm(agent_to_payload, dim=-1)
+    # Both per-agent terms are scored on the step's improvement, not on the
+    # standing value -- the same shape as progress_reward above, one level down.
+    # A difference telescopes: over an episode the sum is only ever
+    # (initial - final), whatever route was taken in between. So holding
+    # position beside the payload pays nothing, and orbiting to farm the cosine
+    # gives back on the way out exactly what it collected on the way in. The
+    # absolute form paid every step for a state already reached, which is what
+    # made both farmable in the first place.
+    curr_agent_payload_dist, curr_alignment = agent_payload_geometry(
+        world_state.agent_pos, world_state.payload_pos, scenario_state.goal_pos)
+    
     proximity_anneal = min(training_progress / config.proximity_anneal_fraction, 1.0)
     proximity_coef = config.proximity_coef_start * (1 - proximity_anneal)
-    proximity_reward = -proximity_coef * dist_agent_to_payload
+    proximity_reward = proximity_coef * (
+        scenario_state.prev_agent_payload_dist - curr_agent_payload_dist)
     
-    # Cosine between "which way does this agent face the payload" and "which
-    # way does the payload have to travel". +1 is directly behind the payload,
-    # the one place a push helps; -1 is in the payload's path. Signed rather
-    # than clamped at zero, so blocking the payload costs what pushing it pays.
-    #
-    # A direction, not a position, so it is scale-free: it says nothing about
-    # closing in, which is proximity's job, and the two anneal independently.
-    agent_to_payload_dir = agent_to_payload / agent_to_payload.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-    goal_dir = scenario_state.goal_pos - world_state.payload_pos
-    goal_dir = (goal_dir / goal_dir.norm(dim=-1, keepdim=True).clamp(min=1e-6)).unsqueeze(1)
-    alignment = (agent_to_payload_dir * goal_dir).sum(-1)          # (E, n_agents) in [-1, 1]
     alignment_anneal = min(training_progress / config.alignment_anneal_fraction, 1.0)
     alignment_coef = config.alignment_coef_start * (1 - alignment_anneal)
-    alignment_reward = alignment_coef * alignment
-    
+    alignment_reward = alignment_coef * (curr_alignment - scenario_state.prev_alignment)
+
+    # PRIVATE: each agent's own distance to the predator. Zero beyond
+    # predator_danger_radius, so this is "you are about to be hit", not a
+    # standing reason to avoid the payload the predator guards. Squared so
+    # both the value and its derivative vanish at the boundary.
+    dist_to_predator = torch.norm(
+        world_state.agent_pos - world_state.predator_pos.unsqueeze(1), dim=-1)
+    intrusion = ((config.predator_danger_radius - dist_to_predator)
+                 .clamp(min=0.0) / config.predator_danger_radius)
+    threat_reward = -config.threat_coef * intrusion.pow(2)
+
+    # SHARED + PRIVATE: update_health drains a flat health_loss_per_step on
+    # any() over agents, so the pool itself does not know who was hit. This
+    # split is the only place per-agent responsibility can enter. The private
+    # share is flat -- blame * health_loss for every agent in range -- not
+    # divided among them, because dividing would make an agent's own bill
+    # shrink as teammates joined it in the danger zone.
+    in_capture = dist_to_predator < config.predator_capture_radius
     health_loss = scenario_state.prev_health - scenario_state.health
-    health_loss_reward =  (-config.health_loss_coef * health_loss).unsqueeze(1).expand(E, config.n_agents)
-    
+    blame = config.health_loss_blame_fraction
+    shared = (1.0 - blame) * health_loss.unsqueeze(1).expand(E, config.n_agents)
+    private = torch.where(
+        in_capture,
+        blame * health_loss.unsqueeze(1).expand(E, config.n_agents),
+        torch.zeros(E, config.n_agents, device=dev),
+    )
+    health_loss_reward = -config.health_loss_coef * (shared + private)
+
+    # SHARED: health hitting zero is a team outcome. Whoever happened to be
+    # touching at the last tick is not the cause.
     captured = (scenario_state.health).clone().detach() <= 0.0
     captured_reward = (captured.float() * config.captured_reward).unsqueeze(1).expand(E, config.n_agents)
-    
+
     agent_wall_force = circle_box_static_forces(world_state.agent_pos, world_state.agent_radius, world_state.wall_center, world_state.wall_halfsize, config.wall_stiffness)
     agent_obstacle_force = circle_box_static_forces(world_state.agent_pos, world_state.agent_radius, world_state.obstacle_center, world_state.obstacle_halfsize, config.obstacle_stiffness)
     collision_magnitude = torch.norm(agent_wall_force + agent_obstacle_force, dim=-1)
     collision_reward =  -config.collision_coef * collision_magnitude
-    
-    reward = progress_reward + time_penalty + success_reward + proximity_reward + alignment_reward + health_loss_reward + captured_reward + collision_reward
-    return reward
-    
+
+    return {
+        "progress": progress_reward,
+        "time": time_penalty,
+        "success": success_reward,
+        "proximity": proximity_reward,
+        "alignment": alignment_reward,
+        "health": health_loss_reward,
+        "captured": captured_reward,
+        "collision": collision_reward,
+        "threat": threat_reward,
+    }
+
+
+def compute_reward(world_state, scenario_state, training_progress, config) -> torch.Tensor:   # (E, n_agents)
+    return torch.stack(tuple(reward_terms(world_state, scenario_state, training_progress, config).values())).sum(0)
+
 def compute_done(world_state, scenario_state, config) -> tuple[torch.Tensor, torch.Tensor]:
     E = world_state.agent_pos.shape[0]
     

@@ -217,6 +217,158 @@ def test_reset_at_no_environments_flagged_changes_nothing():
     assert torch.equal(new_scenario.step_count, scenario_state.step_count)
 
 
+def test_reset_at_masks_per_agent_shaping_baselines_by_environment():
+    """prev_agent_payload_dist and prev_alignment are (E, n_agents), the only
+    prev_ fields that are. reset_at has to mask them on the env axis, so a
+    (E,) mask would broadcast across agents instead and overwrite every
+    environment -- which reads as a free reward spike on the step after any
+    other environment in the batch resets.
+    """
+    config = make_test_config(num_envs=4)
+    generator = torch.Generator().manual_seed(0)
+    world_state, scenario_state = scenario.reset(config.num_envs, config, generator)
+
+    shape = (config.num_envs, config.n_agents)
+    assert scenario_state.prev_agent_payload_dist.shape == shape
+    assert scenario_state.prev_alignment.shape == shape
+
+    needs_reset = torch.tensor([True, False, True, False])
+    new_world, new_scenario = scenario.reset_at(world_state, scenario_state, needs_reset, config, generator)
+
+    assert new_scenario.prev_agent_payload_dist.shape == shape
+    assert new_scenario.prev_alignment.shape == shape
+
+    for env_index in (1, 3):
+        assert torch.equal(new_scenario.prev_agent_payload_dist[env_index],
+                           scenario_state.prev_agent_payload_dist[env_index])
+        assert torch.equal(new_scenario.prev_alignment[env_index],
+                           scenario_state.prev_alignment[env_index])
+
+    # flagged environments get baselines matching their new spawn, so the first
+    # step of the new episode scores a one-step delta rather than a jump
+    expected_dist, expected_alignment = scenario.agent_payload_geometry(
+        new_world.agent_pos, new_world.payload_pos, new_scenario.goal_pos)
+    for env_index in (0, 2):
+        assert torch.allclose(new_scenario.prev_agent_payload_dist[env_index],
+                              expected_dist[env_index], atol=1e-6)
+        assert torch.allclose(new_scenario.prev_alignment[env_index],
+                              expected_alignment[env_index], atol=1e-6)
+
+
+def test_shaping_terms_pay_for_improvement_not_position():
+    """A stationary agent earns nothing from proximity or alignment, however
+    well placed it already is, and closing in earns a positive amount.
+
+    The whole point of the delta form: reward the change, not the standing
+    value. Isolated by zeroing the other reward coefficients, since progress
+    and the time penalty would otherwise dominate the comparison.
+    """
+    config = dataclasses.replace(
+        make_test_config(num_envs=1, n_agents=1),
+        progress_coef=0.0, time_penalty_coef=0.0, success_reward=0.0,
+        health_loss_coef=0.0, captured_reward=0.0, collision_coef=0.0,
+        threat_coef=0.0,
+    )
+    generator = torch.Generator().manual_seed(0)
+    world_state, scenario_state = scenario.reset(1, config, generator)
+
+    # camped: the state is unchanged since the baseline was taken
+    camped = scenario.compute_reward(world_state, scenario_state, 0.0, config)
+    assert torch.allclose(camped, torch.zeros_like(camped), atol=1e-6)
+
+    # closing in along the ray to the payload: the distance shrinks while the
+    # direction, and so the alignment, is untouched
+    toward_payload = world_state.payload_pos.unsqueeze(1) - world_state.agent_pos
+    closer = dataclasses.replace(world_state, agent_pos=world_state.agent_pos + 0.25 * toward_payload)
+    approached = scenario.compute_reward(closer, scenario_state, 0.0, config)
+    assert (approached > 0).all()
+
+
+def test_health_loss_blame_falls_on_the_agent_in_range():
+    """A shared health penalty cannot teach evasion: every agent gets the same
+    number whether it was hit or fifty units away. The private share has to
+    land on the agent actually inside the capture radius, and stay the same
+    size when teammates join it -- otherwise crowding into the danger zone
+    would cut the culprit's own bill.
+    """
+    config = dataclasses.replace(
+        make_test_config(num_envs=1, n_agents=3),
+        progress_coef=0.0, time_penalty_coef=0.0, success_reward=0.0,
+        proximity_coef_start=0.0, alignment_coef_start=0.0,
+        captured_reward=0.0, collision_coef=0.0, threat_coef=0.0,
+        health_loss_coef=1.0, health_loss_blame_fraction=0.7,
+        health_loss_per_step=10.0,
+    )
+    generator = torch.Generator().manual_seed(0)
+    world_state, scenario_state = scenario.reset(1, config, generator)
+    scenario_state = dataclasses.replace(
+        scenario_state,
+        health=torch.full((1,), 100.0),
+        prev_health=torch.full((1,), 100.0),
+        predator_cooldown=torch.zeros(1),
+    )
+
+    agent_pos = world_state.agent_pos.clone()
+    agent_pos[0, 0] = world_state.predator_pos[0]
+    agent_pos[0, 1:] = world_state.predator_pos[0] + 50.0
+    world_state = dataclasses.replace(world_state, agent_pos=agent_pos)
+
+    scenario_state = scenario.update_health(world_state, scenario_state, config)
+    reward = scenario.compute_reward(world_state, scenario_state, 0.0, config)
+    # in-range agent pays shared + private = 0.3*10 + 0.7*10 = 10
+    # others pay shared only = 3
+    assert torch.allclose(reward[0, 0], torch.tensor(-10.0), atol=1e-5)
+    assert torch.allclose(reward[0, 1:], torch.full((2,), -3.0), atol=1e-5)
+
+    # a second agent in range does not dilute the first's bill
+    agent_pos[0, 1] = world_state.predator_pos[0]
+    world_state = dataclasses.replace(world_state, agent_pos=agent_pos)
+    scenario_state = dataclasses.replace(
+        scenario_state,
+        health=torch.full((1,), 100.0),
+        prev_health=torch.full((1,), 100.0),
+        predator_cooldown=torch.zeros(1),
+    )
+    scenario_state = scenario.update_health(world_state, scenario_state, config)
+    reward = scenario.compute_reward(world_state, scenario_state, 0.0, config)
+    assert torch.allclose(reward[0, :2], torch.full((2,), -10.0), atol=1e-5)
+    assert torch.allclose(reward[0, 2], torch.tensor(-3.0), atol=1e-5)
+
+
+def test_threat_term_is_zero_outside_the_danger_radius_and_private():
+    """The DESIGN.md objection to predator-distance shaping is a permanent
+    gradient away from the payload. This term has to be exactly zero beyond
+    its radius, and it has to be private -- agent 0 next to the predator
+    cannot change agent 1's penalty.
+    """
+    config = dataclasses.replace(
+        make_test_config(num_envs=1, n_agents=2),
+        progress_coef=0.0, time_penalty_coef=0.0, success_reward=0.0,
+        proximity_coef_start=0.0, alignment_coef_start=0.0,
+        health_loss_coef=0.0, captured_reward=0.0, collision_coef=0.0,
+        threat_coef=0.3, predator_danger_radius=1.0,
+    )
+    generator = torch.Generator().manual_seed(0)
+    world_state, scenario_state = scenario.reset(1, config, generator)
+
+    agent_pos = world_state.agent_pos.clone()
+    # agent 0 at the predator, agent 1 well outside the zone
+    agent_pos[0, 0] = world_state.predator_pos[0]
+    agent_pos[0, 1] = world_state.predator_pos[0] + 5.0
+    world_state = dataclasses.replace(world_state, agent_pos=agent_pos)
+
+    terms = scenario.reward_terms(world_state, scenario_state, 0.0, config)
+    threat = terms["threat"]
+    assert torch.allclose(threat[0, 0], torch.tensor(-config.threat_coef), atol=1e-5)
+    assert torch.allclose(threat[0, 1], torch.tensor(0.0), atol=1e-5)
+
+    # just outside the radius: identically zero, not a small leftover
+    agent_pos[0, 0] = world_state.predator_pos[0] + torch.tensor([config.predator_danger_radius + 0.01, 0.0])
+    world_state = dataclasses.replace(world_state, agent_pos=agent_pos)
+    threat = scenario.reward_terms(world_state, scenario_state, 0.0, config)["threat"]
+    assert torch.allclose(threat, torch.zeros_like(threat), atol=1e-6)
+
+
 # ---------------------------------------------------------------- obstacle spawn invariants
 
 SPAWN_SEEDS = (0, 1, 2)

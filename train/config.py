@@ -80,7 +80,18 @@ class Config:
     # actually touching (agent_radius + predator_radius = 0.25) so contact is
     # not missed when a fast agent steps clean past the predator.
     predator_capture_radius: float = 0.4
-    predator_cooldown_duration: float = 25.0
+    # Sets the survival budget together with max_health, and that budget has to
+    # outlast a traversal or the task is unwinnable however well the policy
+    # plays: max_health / health_loss_per_step events, one per cooldown, is
+    # 15 * 40 = 600 steps against ~340 for a push to the goal. At 25 it was 260
+    # against 340, so every episode ended in capture before arrival and there
+    # was nothing for preserving health to buy. tests/test_reward_invariants.py
+    # asserts the margin.
+    #
+    # Also the window an agent has to break contact after being hit. Too short
+    # and evasion is not a behaviour the policy can express, only a penalty it
+    # absorbs.
+    predator_cooldown_duration: float = 40.0
     predator_cooldown_speed_factor: float = 0.5
     predator_weight: float = 0.5       # w in the guard formula
     # steps the predator sticks with a target before reconsidering. 20 is one
@@ -137,13 +148,27 @@ class Config:
 
     # rewards
     progress_coef: float = 50
-    time_penalty_coef: float = 0.22
+    # Bounded by DESIGN.md's inequality max_steps * |R_time| < |R_capture|:
+    # if the clock costs more than dying, a policy that cannot win is right to
+    # end the episode early, and it will. The bound is 250 / 900 = 0.28 at these
+    # values, and 0.10 leaves the same kind of headroom DESIGN's original 0.3
+    # against 100 did. It read 0.22 against a 900-step, -150 board, so
+    # 198 > 150 and suicide was strictly optimal -- the derivation in DESIGN.md
+    # was still written against the old 250-step, -100 numbers and had silently
+    # stopped applying. tests/test_reward_invariants.py now asserts it.
+    time_penalty_coef: float = 0.10
     # payload-center to goal-center. The payload's half-diagonal is 0.283, so
     # at the old 0.3 it had to be almost exactly centered on the goal; 0.75
     # only asks it to overlap.
     success_threshold: float = 0.75
     success_reward: float = 450.0
-    proximity_coef_start: float = 0.85
+    proximity_coef_start: float = 8.0
+    # the fraction of training over which the coefficient decays linearly to
+    # zero: coef = start * (1 - min(progress / fraction, 1)). Anything above 1.0
+    # never finishes, leaving a permanent floor of start * (1 - 1/fraction) --
+    # at the 5.0 this used to hold, 8.0 only ever reached 6.4, so the crutch
+    # never came off and proximity and alignment went on pulling all n_agents
+    # onto the same single point behind the payload for the whole run.
     proximity_anneal_fraction: float = 0.6
     # Pays for standing on the far side of the payload from the goal, where a
     # push actually moves it where it needs to go. Proximity says "get close"
@@ -157,15 +182,50 @@ class Config:
     # Annealed on the same reasoning as proximity -- a hint about where to be
     # while progress is too sparse to learn from, removed once pushing works,
     # which is also what stops agents from orbiting to farm the cosine.
-    alignment_coef_start: float = 0.3
+    alignment_coef_start: float = 8.0
     alignment_anneal_fraction: float = 0.6
     health_loss_coef: float = 1.0
+    # How much of a damage event is billed to the agents actually inside
+    # predator_capture_radius, with the remainder still shared by the team.
+    #
+    # A wholly shared penalty is why no agent ever learned to evade. update_health
+    # drains on any() over agents, so one agent's retreat moved its own reward by
+    # nothing at all, while proximity and alignment were private and did respond.
+    # The gradient said "chase the shaping, treat health as weather", and the
+    # policy did: measured cos(action, toward predator) was +0.087, drifting
+    # toward the thing killing it.
+    #
+    # The private share is flat, NOT split among the agents in range. Splitting
+    # would keep the team total constant but make an agent's own bill shrink as
+    # teammates joined it in the danger zone, paying for exactly the bunching
+    # that is already a problem here. Flat means being in range always costs the
+    # same, and the team total rises with crowding.
+    health_loss_blame_fraction: float = 0.7
     # flat drain per damage event. With the cooldown gating events to one per
     # predator_cooldown_duration steps, max_health / this = contacts survived.
     health_loss_per_step: float = 10.0
-    captured_reward: float = -150.0
-    collision_coef: float = 0.0002
-    max_health: float = 100.0
+    # Deep enough that dying beats neither winning nor waiting: against the
+    # inequality above it has to exceed max_steps * time_penalty_coef = 90, and
+    # against a full health drain (-150) it is the worse outcome, which is the
+    # ordering DESIGN.md section 11 asks for.
+    captured_reward: float = -250.0
+    collision_coef: float = 0.002
+    # A private "you are about to be hit" penalty, and the one signal an
+    # individual agent can act on alone. DESIGN.md omits predator-distance
+    # shaping because a permanent version is a permanent reason to avoid the
+    # payload the predator guards; that objection is why this is exactly zero
+    # beyond the radius rather than a global gradient. 1.0 is 2.5x the capture
+    # radius, far tighter than the scripted controller's evade radius of 3.0, so
+    # it fires only when contact is imminent and leaves ordinary pushing alone.
+    predator_danger_radius: float = 1.0
+    # per-step cost at zero distance, falling quadratically to zero at the
+    # radius. 0.3 is 3x the time penalty, and over one cooldown window costs
+    # about the same as one damage event's private share -- the two evasion
+    # signals are meant to be comparable, not for one to drown the other.
+    threat_coef: float = 0.3
+    # 15 events at 40 steps each = 600 steps of life, against ~340 for a
+    # traversal. At 100 the budget was 260 and arrival was impossible.
+    max_health: float = 150.0
 
     # training
     gamma: float = 0.999
@@ -179,7 +239,7 @@ class Config:
     # costs performance and stability; 20480 (2 minibatches) is the obvious
     # one-variable experiment if value loss will not settle.
     minibatch_size: int = 4096
-    num_iterations: int = 250
+    num_iterations: int = 400
     lr: float = 3e-4
     max_grad_norm: float = 0.5
     # Off for the first run so a failure has one candidate cause. The +/-100
