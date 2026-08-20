@@ -112,13 +112,14 @@ def test_shaping_coefficients_anneal_to_zero():
     never reaches zero and leaves a floor of start * (1 - 1/fraction).
 
     Both fractions sat at 5.0, which pinned an 8.0 coefficient at 6.4 forever.
-    Proximity and alignment are exploration crutches that share a single optimum
-    behind the payload; left on, they hold every agent on the same point for the
-    whole run, which is both a bunching incentive and a standing invitation to
-    farm the shaping instead of pushing.
+    Approach is an exploration crutch that pulls agents onto the standoff
+    point behind the payload; left on, it holds every agent on the same point
+    for the whole run, which is both a bunching incentive and a standing
+    invitation to farm the shaping instead of pushing. Push is not annealed:
+    it is the term that pays during sustained contact.
     """
     config = Config()
-    for name in ("proximity_anneal_fraction", "alignment_anneal_fraction"):
+    for name in ("approach_anneal_fraction", "alignment_anneal_fraction"):
         fraction = getattr(config, name)
         assert 0.0 < fraction <= 1.0, (
             f"{name}={fraction} never completes: the coefficient bottoms out at "

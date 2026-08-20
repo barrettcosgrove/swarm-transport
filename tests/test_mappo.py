@@ -98,8 +98,10 @@ def test_one_iteration_produces_the_expected_shapes():
 
     assert {"episodes_completed", "success_rate", "capture_rate", "timeout_rate"} <= set(outcomes)
     for key in ("mean_episode_length", "mean_team_spread", "mean_min_predator_dist",
+                "mean_push_events",
                 "reward_progress", "reward_health", "reward_threat", "reward_push"):
         assert key in outcomes, f"outcomes is missing {key}"
+    assert 0.0 <= outcomes["mean_push_events"] <= config.n_agents
 
 
 def test_actor_never_sees_more_than_its_own_observation():
@@ -136,7 +138,7 @@ def test_actor_forward_is_the_mean_only():
 def test_critic_distinguishes_agents_within_an_environment():
     """Without the one-hot every row of an environment's critic input is
     identical, and a deterministic network must return identical values -- wrong,
-    because compute_reward gives each agent a private proximity term."""
+    because compute_reward gives each agent a private approach term."""
     config = Config()
     critic = Critic(config.obs_dim, config.n_agents, config.hidden_dim)
     obs = torch.randn(2, config.n_agents, config.obs_dim)

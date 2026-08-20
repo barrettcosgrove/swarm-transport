@@ -218,55 +218,41 @@ def test_reset_at_no_environments_flagged_changes_nothing():
 
 
 def test_reset_at_masks_per_agent_shaping_baselines_by_environment():
-    """prev_agent_payload_dist, prev_alignment, and prev_agent_pushpoint_dist
-    are (E, n_agents), the only prev_ fields that are. reset_at has to mask
-    them on the env axis, so a (E,) mask would broadcast across agents instead
-    and overwrite every environment -- which reads as a free reward spike on
-    the step after any other environment in the batch resets.
+    """prev_agent_pushpoint_dist is (E, n_agents), the only prev_ field that
+    is. reset_at has to mask it on the env axis, so a (E,) mask would
+    broadcast across agents instead and overwrite every environment -- which
+    reads as a free reward spike on the step after any other environment in
+    the batch resets.
     """
     config = make_test_config(num_envs=4)
     generator = torch.Generator().manual_seed(0)
     world_state, scenario_state = scenario.reset(config.num_envs, config, generator)
 
     shape = (config.num_envs, config.n_agents)
-    assert scenario_state.prev_agent_payload_dist.shape == shape
-    assert scenario_state.prev_alignment.shape == shape
     assert scenario_state.prev_agent_pushpoint_dist.shape == shape
 
     needs_reset = torch.tensor([True, False, True, False])
     new_world, new_scenario = scenario.reset_at(world_state, scenario_state, needs_reset, config, generator)
 
-    assert new_scenario.prev_agent_payload_dist.shape == shape
-    assert new_scenario.prev_alignment.shape == shape
     assert new_scenario.prev_agent_pushpoint_dist.shape == shape
 
     for env_index in (1, 3):
-        assert torch.equal(new_scenario.prev_agent_payload_dist[env_index],
-                           scenario_state.prev_agent_payload_dist[env_index])
-        assert torch.equal(new_scenario.prev_alignment[env_index],
-                           scenario_state.prev_alignment[env_index])
         assert torch.equal(new_scenario.prev_agent_pushpoint_dist[env_index],
                            scenario_state.prev_agent_pushpoint_dist[env_index])
 
     # flagged environments get baselines matching their new spawn, so the first
     # step of the new episode scores a one-step delta rather than a jump
-    expected_dist, expected_alignment = scenario.agent_payload_geometry(
-        new_world.agent_pos, new_world.payload_pos, new_scenario.goal_pos)
     expected_pushpoint = scenario.agent_pushpoint_geometry(
         new_world.agent_pos, new_world.payload_pos, new_scenario.goal_pos,
         config.push_standoff)
     for env_index in (0, 2):
-        assert torch.allclose(new_scenario.prev_agent_payload_dist[env_index],
-                              expected_dist[env_index], atol=1e-6)
-        assert torch.allclose(new_scenario.prev_alignment[env_index],
-                              expected_alignment[env_index], atol=1e-6)
         assert torch.allclose(new_scenario.prev_agent_pushpoint_dist[env_index],
                               expected_pushpoint[env_index], atol=1e-6)
 
 
 def test_shaping_terms_pay_for_improvement_not_position():
-    """A stationary agent earns nothing from proximity or alignment, however
-    well placed it already is, and closing in earns a positive amount.
+    """A stationary agent earns nothing from approach, however well placed it
+    already is, and closing on the standoff point earns a positive amount.
 
     The whole point of the delta form: reward the change, not the standing
     value. Isolated by zeroing the other reward coefficients, since progress
@@ -285,10 +271,14 @@ def test_shaping_terms_pay_for_improvement_not_position():
     camped = scenario.compute_reward(world_state, scenario_state, 0.0, config)
     assert torch.allclose(camped, torch.zeros_like(camped), atol=1e-6)
 
-    # closing in along the ray to the payload: the distance shrinks while the
-    # direction, and so the alignment, is untouched
-    toward_payload = world_state.payload_pos.unsqueeze(1) - world_state.agent_pos
-    closer = dataclasses.replace(world_state, agent_pos=world_state.agent_pos + 0.25 * toward_payload)
+    # closing in along the ray to the standoff point, not the payload center:
+    # the two can point different directions, and approach is the term that
+    # is supposed to fire here
+    goal_dir = scenario_state.goal_pos - world_state.payload_pos
+    goal_dir = goal_dir / goal_dir.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+    push_point = world_state.payload_pos - goal_dir * config.push_standoff
+    toward_pushpoint = push_point.unsqueeze(1) - world_state.agent_pos
+    closer = dataclasses.replace(world_state, agent_pos=world_state.agent_pos + 0.25 * toward_pushpoint)
     approached = scenario.compute_reward(closer, scenario_state, 0.0, config)
     assert (approached > 0).all()
 
@@ -303,7 +293,7 @@ def test_health_loss_blame_falls_on_the_agent_in_range():
     config = dataclasses.replace(
         make_test_config(num_envs=1, n_agents=3),
         progress_coef=0.0, time_penalty_coef=0.0, success_reward=0.0,
-        proximity_coef_start=0.0, alignment_coef_start=0.0,
+        approach_coef_start=0.0, alignment_coef_start=0.0,
         captured_reward=0.0, collision_coef=0.0, threat_coef=0.0,
         push_coef=0.0,
         health_loss_coef=1.0, health_loss_blame_fraction=0.7,
@@ -354,7 +344,7 @@ def test_threat_term_is_zero_outside_the_danger_radius_and_private():
     config = dataclasses.replace(
         make_test_config(num_envs=1, n_agents=2),
         progress_coef=0.0, time_penalty_coef=0.0, success_reward=0.0,
-        proximity_coef_start=0.0, alignment_coef_start=0.0,
+        approach_coef_start=0.0, alignment_coef_start=0.0,
         health_loss_coef=0.0, captured_reward=0.0, collision_coef=0.0,
         threat_coef=0.3, predator_danger_radius=1.0, push_coef=0.0,
     )
@@ -379,16 +369,17 @@ def test_threat_term_is_zero_outside_the_danger_radius_and_private():
     assert torch.allclose(threat, torch.zeros_like(threat), atol=1e-6)
 
 
-def test_push_reward_pays_for_closing_on_the_standoff_point():
+def test_approach_reward_pays_for_closing_on_the_standoff_point():
     """Hovering at the standoff point pays nothing; closing in pays; backing
-    off costs the same amount. Same delta shape as proximity, different target:
-    the place a push actually helps, not the payload's center.
+    off costs the same amount. A delta to a target that translates with the
+    payload, so this term is silent during sustained pushing -- that is
+    push_reward's job.
     """
     config = dataclasses.replace(
         make_test_config(num_envs=1, n_agents=1),
         progress_coef=0.0, time_penalty_coef=0.0, success_reward=0.0,
-        proximity_coef_start=0.0, health_loss_coef=0.0, captured_reward=0.0,
-        collision_coef=0.0, threat_coef=0.0, push_coef=8.0,
+        approach_coef_start=8.0, health_loss_coef=0.0, captured_reward=0.0,
+        collision_coef=0.0, threat_coef=0.0, push_coef=0.0,
         push_standoff=1.0,
     )
     generator = torch.Generator().manual_seed(0)
@@ -417,19 +408,116 @@ def test_push_reward_pays_for_closing_on_the_standoff_point():
 
     hover = dataclasses.replace(world_state, agent_pos=start)
     assert torch.allclose(
-        scenario.reward_terms(hover, scenario_state, 0.0, config)["push"],
+        scenario.reward_terms(hover, scenario_state, 0.0, config)["approach"],
         torch.zeros(1, 1), atol=1e-6)
 
     toward = dataclasses.replace(
         world_state, agent_pos=torch.tensor([[[-1.5, 0.0]]]))
-    push_toward = scenario.reward_terms(toward, scenario_state, 0.0, config)["push"]
-    assert (push_toward > 0).all()
+    approach_toward = scenario.reward_terms(toward, scenario_state, 0.0, config)["approach"]
+    assert (approach_toward > 0).all()
 
     away = dataclasses.replace(
         world_state, agent_pos=torch.tensor([[[-2.5, 0.0]]]))
-    push_away = scenario.reward_terms(away, scenario_state, 0.0, config)["push"]
-    assert (push_away < 0).all()
-    assert torch.allclose(push_toward, -push_away, atol=1e-5)
+    approach_away = scenario.reward_terms(away, scenario_state, 0.0, config)["approach"]
+    assert (approach_away < 0).all()
+    assert torch.allclose(approach_toward, -approach_away, atol=1e-5)
+
+
+def test_push_reward_pays_for_goalward_contact_force():
+    """No overlap pays nothing; shoving the payload toward the goal pays;
+    shoving it the other way costs. Hovering at the standoff point, which
+    is outside contact, also pays nothing -- that is the failure mode a
+    delta-to-point term has, and the reason this term exists.
+    """
+    config = dataclasses.replace(
+        make_test_config(num_envs=1, n_agents=2),
+        progress_coef=0.0, time_penalty_coef=0.0, success_reward=0.0,
+        approach_coef_start=0.0, health_loss_coef=0.0, captured_reward=0.0,
+        collision_coef=0.0, threat_coef=0.0, push_coef=8.0,
+    )
+    generator = torch.Generator().manual_seed(0)
+    world_state, scenario_state = scenario.reset(1, config, generator)
+
+    payload = torch.tensor([[0.0, 0.0]])
+    goal = torch.tensor([[5.0, 0.0]])
+    far = torch.tensor([10.0, 10.0])
+    world_state = dataclasses.replace(
+        world_state, payload_pos=payload,
+        predator_pos=torch.tensor([[50.0, 50.0]]),
+        obstacle_center=torch.full_like(world_state.obstacle_center, 1e6),
+    )
+    scenario_state = dataclasses.replace(scenario_state, goal_pos=goal)
+
+    # no overlap: agent 0 well behind the payload, agent 1 far away
+    no_contact = dataclasses.replace(
+        world_state, agent_pos=torch.tensor([[[-2.0, 0.0], far.tolist()]]))
+    assert torch.allclose(
+        scenario.reward_terms(no_contact, scenario_state, 0.0, config)["push"],
+        torch.zeros(1, 2), atol=1e-6)
+
+    # standoff is outside the contact shell (0.45 vs halfsize 0.2 + radius 0.1)
+    at_standoff = dataclasses.replace(
+        world_state, agent_pos=torch.tensor([[[-config.push_standoff, 0.0], far.tolist()]]))
+    assert torch.allclose(
+        scenario.reward_terms(at_standoff, scenario_state, 0.0, config)["push"],
+        torch.zeros(1, 2), atol=1e-6)
+
+    # overlap from behind: force on the payload is +x, along the goal
+    behind = dataclasses.replace(
+        world_state, agent_pos=torch.tensor([[[-0.25, 0.0], far.tolist()]]))
+    push_behind = scenario.reward_terms(behind, scenario_state, 0.0, config)["push"]
+    assert (push_behind[0, 0] > 0).all()
+    assert torch.allclose(push_behind[0, 1], torch.tensor(0.0), atol=1e-6)
+
+    # overlap from in front: force on the payload is -x, against the goal
+    in_front = dataclasses.replace(
+        world_state, agent_pos=torch.tensor([[[0.25, 0.0], far.tolist()]]))
+    push_front = scenario.reward_terms(in_front, scenario_state, 0.0, config)["push"]
+    assert (push_front[0, 0] < 0).all()
+    assert torch.allclose(push_front[0, 1], torch.tensor(0.0), atol=1e-6)
+
+
+def test_approach_anneals_and_push_does_not():
+    """Approach is an exploration crutch and must be silent by the end of
+    training. Push is the task and must still pay for contact then.
+    """
+    config = dataclasses.replace(
+        make_test_config(num_envs=1, n_agents=1),
+        progress_coef=0.0, time_penalty_coef=0.0, success_reward=0.0,
+        approach_coef_start=8.0, health_loss_coef=0.0, captured_reward=0.0,
+        collision_coef=0.0, threat_coef=0.0, push_coef=8.0,
+        push_standoff=1.0,
+    )
+    generator = torch.Generator().manual_seed(0)
+    world_state, scenario_state = scenario.reset(1, config, generator)
+
+    payload = torch.tensor([[0.0, 0.0]])
+    goal = torch.tensor([[5.0, 0.0]])
+    world_state = dataclasses.replace(
+        world_state, payload_pos=payload,
+        predator_pos=torch.tensor([[50.0, 50.0]]),
+        obstacle_center=torch.full_like(world_state.obstacle_center, 1e6),
+    )
+    start = torch.tensor([[[-2.0, 0.0]]])
+    closer = torch.tensor([[[-1.5, 0.0]]])
+    scenario_state = dataclasses.replace(
+        scenario_state, goal_pos=goal,
+        prev_agent_pushpoint_dist=scenario.agent_pushpoint_geometry(
+            start, payload, goal, config.push_standoff),
+    )
+    approaching = dataclasses.replace(world_state, agent_pos=closer)
+
+    early = scenario.reward_terms(approaching, scenario_state, 0.0, config)["approach"]
+    late = scenario.reward_terms(approaching, scenario_state, 1.0, config)["approach"]
+    assert (early > 0).all()
+    assert torch.allclose(late, torch.zeros_like(late), atol=1e-6)
+
+    overlapping = dataclasses.replace(
+        world_state, agent_pos=torch.tensor([[[-0.25, 0.0]]]))
+    push_early = scenario.reward_terms(overlapping, scenario_state, 0.0, config)["push"]
+    push_late = scenario.reward_terms(overlapping, scenario_state, 1.0, config)["push"]
+    assert (push_early > 0).all()
+    assert torch.allclose(push_early, push_late, atol=1e-6)
 
 
 def test_threat_is_silent_while_the_predator_is_on_cooldown():
@@ -440,7 +528,7 @@ def test_threat_is_silent_while_the_predator_is_on_cooldown():
     config = dataclasses.replace(
         make_test_config(num_envs=1, n_agents=1),
         progress_coef=0.0, time_penalty_coef=0.0, success_reward=0.0,
-        proximity_coef_start=0.0, health_loss_coef=0.0, captured_reward=0.0,
+        approach_coef_start=0.0, health_loss_coef=0.0, captured_reward=0.0,
         collision_coef=0.0, threat_coef=0.10, predator_danger_radius=1.0,
         push_coef=0.0,
     )

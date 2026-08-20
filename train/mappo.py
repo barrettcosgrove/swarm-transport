@@ -108,7 +108,7 @@ class Critic(nn.Module):
     The one-hot is the only thing distinguishing the n_agents rows belonging to
     one environment: without it they are byte-identical, and a deterministic
     network would have to return the same value for all of them. That would be
-    wrong, because compute_reward gives each agent a private proximity_reward
+    wrong, because compute_reward gives each agent a private approach_reward
     and collision_reward.
     """
 
@@ -468,7 +468,7 @@ class MAPPOTrainer:
         self.buffer.clear()
         N = self.config.n_agents
         successes = captures = timeouts = episodes = 0
-        spread_sum = pred_sum = 0.0
+        spread_sum = pred_sum = push_events_sum = 0.0
         n_beh_steps = 0
 
         for step in range(self.config.rollout_steps):
@@ -509,12 +509,15 @@ class MAPPOTrainer:
 
             # per-step behavioural diagnostics: team spread and predator
             # distance distinguish "learning to evade" from "learning to quit",
-            # and neither is visible in the return
+            # and neither is visible in the return. Push events count actual
+            # contact (push_reward != 0), which reward_push cannot: that one
+            # mixes how often agents touch the payload with how hard they push.
             ws = info["world_state"]
             centroid = ws.agent_pos.mean(dim=1, keepdim=True)
             spread_sum += (ws.agent_pos - centroid).norm(dim=-1).mean().item()
             pred_dist = (ws.agent_pos - ws.predator_pos.unsqueeze(1)).norm(dim=-1)
             pred_sum += pred_dist.min(dim=-1).values.mean().item()
+            push_events_sum += (terms["push"] != 0).float().sum(-1).mean().item()
             n_beh_steps += 1
 
             self.episode_return += reward.mean(-1)
@@ -559,6 +562,7 @@ class MAPPOTrainer:
             "mean_episode_length": _mean(self.episode_lengths),
             "mean_team_spread": spread_sum / n_beh_steps,
             "mean_min_predator_dist": pred_sum / n_beh_steps,
+            "mean_push_events": push_events_sum / n_beh_steps,
         }
         if self.episode_term_returns is not None:
             for name, values in self.episode_term_returns.items():

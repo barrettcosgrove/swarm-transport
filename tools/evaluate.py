@@ -129,7 +129,7 @@ if __name__ == "__main__":
     from train.checkpoints import load_checkpoint
     from train.mappo import Actor, Critic
 
-    CHECKPOINT = "train/checkpoints/preview_100_obs_norm/checkpoint_100.pt"
+    CHECKPOINT = "train/checkpoints/preview_100_approach_push_proximity/checkpoint_100.pt"
 
     config = Config(num_envs=16)
     actor = Actor(config.obs_dim, 2, config.hidden_dim)
@@ -142,4 +142,4 @@ if __name__ == "__main__":
             return actor(scenario.observe(world_state, scenario_state, cfg)).clamp(-1.0, 1.0)
 
     print(HEADER)
-    print(format_report(evaluate(config, actor_policy), "preview_100_obs_norm"))
+    print(format_report(evaluate(config, actor_policy), "preview_100_approach_push_proximity"))

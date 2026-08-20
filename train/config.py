@@ -10,7 +10,7 @@ class Config:
     # tools/calibrate.py recommends 486 for the DESIGN 50-70% traversal target.
     # Held deliberately slack while the scripted controller is still marginal,
     # so failures read as "couldn't do it" rather than "ran out of clock".
-    max_steps: int = 900
+    max_steps: int = 600
     dt: float = 0.05
 
     # sizes and masses
@@ -167,19 +167,21 @@ class Config:
     # only asks it to overlap.
     success_threshold: float = 0.75
     success_reward: float = 450.0
-    proximity_coef_start: float = 8.0
+    approach_coef_start: float = 8.0
     # the fraction of training over which the coefficient decays linearly to
     # zero: coef = start * (1 - min(progress / fraction, 1)). Anything above 1.0
     # never finishes, leaving a permanent floor of start * (1 - 1/fraction) --
     # at the 5.0 this used to hold, 8.0 only ever reached 6.4, so the crutch
-    # never came off and proximity and alignment went on pulling all n_agents
-    # onto the same single point behind the payload for the whole run.
-    proximity_anneal_fraction: float = 0.6
-    # Per-unit distance closed toward the standoff point behind the payload.
-    # Same shape as proximity, different target: payload center vs the place a
-    # push actually helps. Hovering pays 0. Does not anneal -- pushing is the
-    # task, same as progress. 8.0 matches proximity_coef_start, so a 0.05-unit
-    # close-in is +0.4/step, 4x the time penalty.
+    # never came off and approach went on pulling all n_agents onto the same
+    # standoff point for the whole run.
+    approach_anneal_fraction: float = 0.6
+    # This agent's own contact force on the payload, projected onto the goal
+    # direction and divided by payload_stiffness so the scale is penetration
+    # depth. Zero with no overlap -- cannot be farmed by hovering at the push
+    # point. Does not anneal: this is the term that pays during sustained
+    # pushing, which approach_reward cannot (the standoff point translates with
+    # the payload, so an agent holding it closes nothing). 8.0 matches
+    # approach_coef_start.
     push_coef: float = 8.0
     # Staging offset behind the payload, along the payload->goal line. Default is
     # payload_halfsize.max() + agent_radius + 0.15, the same number the scripted
@@ -196,7 +198,7 @@ class Config:
     #
     # A wholly shared penalty is why no agent ever learned to evade. update_health
     # drains on any() over agents, so one agent's retreat moved its own reward by
-    # nothing at all, while proximity and alignment were private and did respond.
+    # nothing at all, while approach and push were private and did respond.
     # The gradient said "chase the shaping, treat health as weather", and the
     # policy did: measured cos(action, toward predator) was +0.087, drifting
     # toward the thing killing it.
@@ -231,7 +233,7 @@ class Config:
     threat_coef: float = 0.10
     # 15 events at 40 steps each = 600 steps of life, against ~340 for a
     # traversal. At 100 the budget was 260 and arrival was impossible.
-    max_health: float = 150.0
+    max_health: float = 100.0
 
     # observation scaling. Positions / 8.5 maps the arena inner faces to
     # [-1, 1]; velocities / 5.0 maps ordinary motion similarly. Offsets are
@@ -313,7 +315,7 @@ class Config:
         The one-hot is what distinguishes the n_agents rows of an environment's
         critic input -- without it a deterministic network must return the same
         value for every agent, which is wrong, since compute_reward gives each
-        agent a private proximity and collision term.
+        agent a private approach, push and collision term.
 
         Grows linearly with n_agents while the sample budget does not. If value
         loss will not settle, this is a candidate cause, and the fix is a

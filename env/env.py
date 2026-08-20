@@ -17,8 +17,7 @@ import dataclasses
 7. build the info dict from the pre-reset state
 8. scenario.reset_at()        -> respawn the environments that finished
 9. dataclasses.replace on scenario_state to advance step_count and re-baseline
-   the shaping terms: prev_payload_dist, prev_agent_payload_dist, prev_alignment,
-   prev_agent_pushpoint_dist
+   the shaping terms: prev_payload_dist, prev_agent_pushpoint_dist
 10. scenario.observe()        -> the observation actually returned, post-reset
 """
 
@@ -69,8 +68,6 @@ class Env:
         # compute_done and the renderer both read step_count under this
         # convention, and moving the increment would shift truncation by a step.
         current_payload_dist = torch.norm(self.world_state.payload_pos - self.scenario_state.goal_pos , dim=-1)
-        current_agent_payload_dist, current_alignment = scenario.agent_payload_geometry(
-            self.world_state.agent_pos, self.world_state.payload_pos, self.scenario_state.goal_pos)
         current_agent_pushpoint_dist = scenario.agent_pushpoint_geometry(
             self.world_state.agent_pos, self.world_state.payload_pos,
             self.scenario_state.goal_pos, self.config.push_standoff)
@@ -78,8 +75,6 @@ class Env:
             self.scenario_state,
             step_count=self.scenario_state.step_count + 1,
             prev_payload_dist=current_payload_dist,
-            prev_agent_payload_dist=current_agent_payload_dist,
-            prev_alignment=current_alignment,
             prev_agent_pushpoint_dist=current_agent_pushpoint_dist,
         )
         
