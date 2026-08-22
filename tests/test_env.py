@@ -244,7 +244,7 @@ def test_reset_at_masks_per_agent_shaping_baselines_by_environment():
     # step of the new episode scores a one-step delta rather than a jump
     expected_pushpoint = scenario.agent_pushpoint_geometry(
         new_world.agent_pos, new_world.payload_pos, new_scenario.goal_pos,
-        config.push_standoff)
+        config.approach_target_standoff)
     for env_index in (0, 2):
         assert torch.allclose(new_scenario.prev_agent_pushpoint_dist[env_index],
                               expected_pushpoint[env_index], atol=1e-6)
@@ -276,7 +276,7 @@ def test_shaping_terms_pay_for_improvement_not_position():
     # is supposed to fire here
     goal_dir = scenario_state.goal_pos - world_state.payload_pos
     goal_dir = goal_dir / goal_dir.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-    push_point = world_state.payload_pos - goal_dir * config.push_standoff
+    push_point = world_state.payload_pos - goal_dir * config.approach_target_standoff
     toward_pushpoint = push_point.unsqueeze(1) - world_state.agent_pos
     closer = dataclasses.replace(world_state, agent_pos=world_state.agent_pos + 0.25 * toward_pushpoint)
     approached = scenario.compute_reward(closer, scenario_state, 0.0, config)
@@ -380,7 +380,7 @@ def test_approach_reward_pays_for_closing_on_the_standoff_point():
         progress_coef=0.0, time_penalty_coef=0.0, success_reward=0.0,
         approach_coef_start=8.0, health_loss_coef=0.0, captured_reward=0.0,
         collision_coef=0.0, threat_coef=0.0, push_coef=0.0,
-        push_standoff=1.0,
+        approach_target_standoff=1.0,
     )
     generator = torch.Generator().manual_seed(0)
     world_state, scenario_state = scenario.reset(1, config, generator)
@@ -396,14 +396,14 @@ def test_approach_reward_pays_for_closing_on_the_standoff_point():
 
     # geometry sanity: payload origin, goal +x, standoff 1 -> push point at (-1, 0)
     dist = scenario.agent_pushpoint_geometry(
-        torch.tensor([[[-1.0, 0.0]]]), payload, goal, config.push_standoff)
+        torch.tensor([[[-1.0, 0.0]]]), payload, goal, config.approach_target_standoff)
     assert torch.allclose(dist, torch.zeros(1, 1), atol=1e-6)
 
     start = torch.tensor([[[-2.0, 0.0]]])
     scenario_state = dataclasses.replace(
         scenario_state,
         prev_agent_pushpoint_dist=scenario.agent_pushpoint_geometry(
-            start, payload, goal, config.push_standoff),
+            start, payload, goal, config.approach_target_standoff),
     )
 
     hover = dataclasses.replace(world_state, agent_pos=start)
@@ -477,16 +477,17 @@ def test_push_reward_pays_for_goalward_contact_force():
     assert torch.allclose(push_front[0, 1], torch.tensor(0.0), atol=1e-6)
 
 
-def test_approach_anneals_and_push_does_not():
-    """Approach is an exploration crutch and must be silent by the end of
+def test_approach_anneals_when_fraction_is_set_and_push_does_not():
+    """A fraction in (0, 1] still takes the approach crutch off by the end of
     training. Push is the task and must still pay for contact then.
     """
     config = dataclasses.replace(
         make_test_config(num_envs=1, n_agents=1),
         progress_coef=0.0, time_penalty_coef=0.0, success_reward=0.0,
-        approach_coef_start=8.0, health_loss_coef=0.0, captured_reward=0.0,
+        approach_coef_start=8.0, approach_anneal_fraction=0.6,
+        health_loss_coef=0.0, captured_reward=0.0,
         collision_coef=0.0, threat_coef=0.0, push_coef=8.0,
-        push_standoff=1.0,
+        approach_target_standoff=1.0,
     )
     generator = torch.Generator().manual_seed(0)
     world_state, scenario_state = scenario.reset(1, config, generator)
@@ -503,7 +504,7 @@ def test_approach_anneals_and_push_does_not():
     scenario_state = dataclasses.replace(
         scenario_state, goal_pos=goal,
         prev_agent_pushpoint_dist=scenario.agent_pushpoint_geometry(
-            start, payload, goal, config.push_standoff),
+            start, payload, goal, config.approach_target_standoff),
     )
     approaching = dataclasses.replace(world_state, agent_pos=closer)
 
@@ -518,6 +519,44 @@ def test_approach_anneals_and_push_does_not():
     push_late = scenario.reward_terms(overlapping, scenario_state, 1.0, config)["push"]
     assert (push_early > 0).all()
     assert torch.allclose(push_early, push_late, atol=1e-6)
+
+
+def test_approach_anneal_fraction_zero_keeps_the_coefficient():
+    """0.0 is the sentinel for a constant approach coefficient. The 250-run
+    that kept it on is what taught return-to-the-box; this is the check that
+    training_progress=1.0 does not silently zero the term.
+    """
+    config = dataclasses.replace(
+        make_test_config(num_envs=1, n_agents=1),
+        progress_coef=0.0, time_penalty_coef=0.0, success_reward=0.0,
+        approach_coef_start=8.0, approach_anneal_fraction=0.0,
+        health_loss_coef=0.0, captured_reward=0.0,
+        collision_coef=0.0, threat_coef=0.0, push_coef=0.0,
+        approach_target_standoff=1.0,
+    )
+    generator = torch.Generator().manual_seed(0)
+    world_state, scenario_state = scenario.reset(1, config, generator)
+
+    payload = torch.tensor([[0.0, 0.0]])
+    goal = torch.tensor([[5.0, 0.0]])
+    world_state = dataclasses.replace(
+        world_state, payload_pos=payload,
+        predator_pos=torch.tensor([[50.0, 50.0]]),
+        obstacle_center=torch.full_like(world_state.obstacle_center, 1e6),
+    )
+    start = torch.tensor([[[-2.0, 0.0]]])
+    closer = torch.tensor([[[-1.5, 0.0]]])
+    scenario_state = dataclasses.replace(
+        scenario_state, goal_pos=goal,
+        prev_agent_pushpoint_dist=scenario.agent_pushpoint_geometry(
+            start, payload, goal, config.approach_target_standoff),
+    )
+    approaching = dataclasses.replace(world_state, agent_pos=closer)
+
+    early = scenario.reward_terms(approaching, scenario_state, 0.0, config)["approach"]
+    late = scenario.reward_terms(approaching, scenario_state, 1.0, config)["approach"]
+    assert (early > 0).all()
+    assert torch.allclose(early, late, atol=1e-6)
 
 
 def test_threat_is_silent_while_the_predator_is_on_cooldown():
@@ -789,3 +828,23 @@ def test_sustained_thrust_cannot_push_a_body_out_of_the_arena():
     # observations too, through the relative-position block.
     bound = max(2 * midline, 2 * config.agent_max_speed)
     assert max_obs < bound, f"observations reached {max_obs:.1f} with bodies still inside the arena"
+
+
+def test_payload_side_masks_split_behind_from_front():
+    """position_ratio's two counts have to disagree on an agent sitting on the
+    goal line's push side versus its blocking side."""
+    config = make_test_config(num_envs=1, n_agents=2)
+    generator = torch.Generator().manual_seed(0)
+    world_state, scenario_state = scenario.reset(1, config, generator)
+    payload = torch.tensor([[0.0, 0.0]])
+    goal = torch.tensor([[5.0, 0.0]])
+    world_state = dataclasses.replace(
+        world_state,
+        payload_pos=payload,
+        agent_pos=torch.tensor([[[-0.4, 0.0], [0.4, 0.0]]]),
+    )
+    scenario_state = dataclasses.replace(scenario_state, goal_pos=goal)
+
+    behind, front = scenario.payload_side_masks(world_state, scenario_state, 0.5)
+    assert bool(behind[0, 0]) and not bool(front[0, 0])
+    assert bool(front[0, 1]) and not bool(behind[0, 1])

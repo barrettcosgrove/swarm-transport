@@ -113,18 +113,22 @@ def test_shaping_coefficients_anneal_to_zero():
 
     Both fractions sat at 5.0, which pinned an 8.0 coefficient at 6.4 forever.
     Approach is an exploration crutch that pulls agents onto the standoff
-    point behind the payload; left on, it holds every agent on the same point
-    for the whole run, which is both a bunching incentive and a standing
-    invitation to farm the shaping instead of pushing. Push is not annealed:
-    it is the term that pays during sustained contact.
+    point behind the payload. 0.0 is a legal sentinel meaning "do not anneal"
+    (the 250-run that kept it on taught return-to-the-box). A value in (0, 1]
+    still completes; anything above 1.0 is the old floor bug. Push is not
+    annealed: it is the term that pays during sustained contact.
     """
     config = Config()
-    for name in ("approach_anneal_fraction", "alignment_anneal_fraction"):
-        fraction = getattr(config, name)
-        assert 0.0 < fraction <= 1.0, (
-            f"{name}={fraction} never completes: the coefficient bottoms out at "
-            f"{100 * (1 - 1 / fraction):.0f}% of its starting value"
-        )
+    assert config.approach_anneal_fraction == 0.0, (
+        "approach_anneal_fraction is the constant-coefficient sentinel; "
+        f"got {config.approach_anneal_fraction}"
+    )
+    fraction = config.alignment_anneal_fraction
+    assert 0.0 < fraction <= 1.0, (
+        f"alignment_anneal_fraction={fraction} never completes: the "
+        f"coefficient bottoms out at {100 * (1 - 1 / fraction):.0f}% of "
+        f"its starting value"
+    )
 
 
 def test_blame_fraction_is_a_fraction():

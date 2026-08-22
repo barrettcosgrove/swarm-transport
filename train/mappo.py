@@ -16,6 +16,7 @@ actor and one critic here and nothing else.
 Usage:
     python -m train.mappo
 """
+import dataclasses
 import json
 import os
 import time
@@ -25,6 +26,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from env import scenario
 from env.env import Env
 from train.checkpoints import save_checkpoint, load_checkpoint
 from train.config import Config
@@ -396,6 +398,8 @@ class TrainingLogger:
                 f"cap {record['capture_rate']:>5.1%}  "
                 f"to {record['timeout_rate']:>5.1%}  "
                 f"len {record['mean_episode_length']:>6.0f}  "
+                f"pos {record['position_ratio']:>5.2f}  "
+                f"peff {record['push_efficiency']:>5.1%}  "
                 f"pi {record['policy_loss']:>7.4f}  "
                 f"v {record['value_loss']:>9.3f}  "
                 f"ent {record['entropy']:>6.3f}  "
@@ -443,6 +447,7 @@ class MAPPOTrainer:
 
         self.obs = None
         self.total_env_steps = 0
+        self.best_win_rate = -1.0
 
         # episode bookkeeping, carried across iterations because an episode is
         # far longer than a rollout: at max_steps 900 and rollout_steps 128 a
@@ -469,6 +474,11 @@ class MAPPOTrainer:
         N = self.config.n_agents
         successes = captures = timeouts = episodes = 0
         spread_sum = pred_sum = push_events_sum = 0.0
+        contact_cosine_sum = contact_count = 0.0
+        push_signed_sum = push_abs_sum = 0.0
+        agent_payload_dist_sum = 0.0
+        behind_count = front_count = 0
+        force_goal_sum = force_mag_sum = 0.0
         n_beh_steps = 0
 
         for step in range(self.config.rollout_steps):
@@ -518,6 +528,36 @@ class MAPPOTrainer:
             pred_dist = (ws.agent_pos - ws.predator_pos.unsqueeze(1)).norm(dim=-1)
             pred_sum += pred_dist.min(dim=-1).values.mean().item()
             push_events_sum += (terms["push"] != 0).float().sum(-1).mean().item()
+
+            agent_payload = ws.agent_pos - ws.payload_pos.unsqueeze(1)
+            agent_payload_dist = agent_payload.norm(dim=-1)
+            goal_dir = info["scenario_state"].goal_pos - ws.payload_pos
+            goal_dir = goal_dir / goal_dir.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+            contact_range = self.config.payload_halfsize.max() + self.config.agent_radius
+            in_contact = agent_payload_dist <= contact_range
+            contact_cosine = (
+                agent_payload * goal_dir.unsqueeze(1)
+            ).sum(-1) / agent_payload_dist.clamp(min=1e-6)
+            contact_cosine_sum += contact_cosine[in_contact].sum().item()
+            contact_count += in_contact.sum().item()
+            agent_payload_dist_sum += agent_payload_dist.mean().item()
+            behind, front = scenario.payload_side_masks(
+                ws, info["scenario_state"], self.config.push_zone_radius)
+            behind_count += int(behind.sum())
+            front_count += int(front.sum())
+            goalward, magnitude = scenario.payload_goalward_force(
+                ws, info["scenario_state"], self.config)
+            force_goal_sum += goalward.sum().item()
+            force_mag_sum += magnitude.sum().item()
+            if self.config.push_coef:
+                push_penetration = terms["push"] / self.config.push_coef
+            else:
+                push_penetration = scenario.goalward_push_penetration(
+                    ws, info["scenario_state"], self.config)
+            # Use the same contact samples and denominator for both push
+            # metrics, so signed / absolute directly measures cancellation.
+            push_signed_sum += push_penetration[in_contact].sum().item()
+            push_abs_sum += push_penetration[in_contact].abs().sum().item()
             n_beh_steps += 1
 
             self.episode_return += reward.mean(-1)
@@ -563,6 +603,12 @@ class MAPPOTrainer:
             "mean_team_spread": spread_sum / n_beh_steps,
             "mean_min_predator_dist": pred_sum / n_beh_steps,
             "mean_push_events": push_events_sum / n_beh_steps,
+            "mean_contact_cosine": contact_cosine_sum / contact_count if contact_count else 0.0,
+            "mean_push_abs": push_abs_sum / contact_count if contact_count else 0.0,
+            "mean_push_signed": push_signed_sum / contact_count if contact_count else 0.0,
+            "mean_agent_payload_dist": agent_payload_dist_sum / n_beh_steps,
+            "position_ratio": behind_count / max(front_count, 1),
+            "push_efficiency": force_goal_sum / force_mag_sum if force_mag_sum else 0.0,
         }
         if self.episode_term_returns is not None:
             for name, values in self.episode_term_returns.items():
@@ -658,6 +704,10 @@ class MAPPOTrainer:
 
             last_value, outcomes = self.collect_rollout(progress)
             advantages, returns = self.buffer.compute_gae(last_value, cfg.gamma, cfg.gae_lambda)
+            team_adv = advantages.mean(-1, keepdim=True)
+            adv_var = advantages.var()
+            outcomes["advantage_private_fraction"] = (
+                float((advantages - team_adv).var() / adv_var) if float(adv_var) > 0.0 else 0.0)
             flat = self.buffer.flatten(self.critic, advantages, returns)
 
             # Linear anneal uses the configured full-run horizon even when
@@ -672,6 +722,14 @@ class MAPPOTrainer:
 
             returns_tensor = torch.tensor(list(self.episode_returns)) if self.episode_returns \
                 else torch.zeros(1)
+            is_final = iteration == stop_at
+            eval_stats = {}
+            if cfg.eval_interval and (iteration % cfg.eval_interval == 0 or is_final):
+                eval_stats = self.evaluate_policy()
+                if eval_stats["eval_win_rate"] >= self.best_win_rate:
+                    self.best_win_rate = eval_stats["eval_win_rate"]
+                    self.save(os.path.join(cfg.checkpoint_dir, "checkpoint_best.pt"), iteration)
+
             record = {
                 "iteration": iteration,
                 "total_env_steps": self.total_env_steps,
@@ -684,17 +742,33 @@ class MAPPOTrainer:
                 "state_dim": cfg.state_dim,
                 **outcomes,
                 **losses,
+                **eval_stats,
             }
             self.logger.log(record)
             if verbose:
                 print(TrainingLogger.format(record), flush=True)
 
-            is_final = iteration == stop_at
             if iteration % cfg.checkpoint_interval == 0 or is_final:
                 self.save_periodic(iteration, final=is_final)
 
         self.logger.write()
         return self.logger.history
+
+    def evaluate_policy(self):
+        """Blocking eval on a fresh env batch. Does not touch the training env."""
+        from tools.evaluate import evaluate
+
+        cfg = dataclasses.replace(self.config, num_envs=self.config.eval_num_envs)
+        actor = self.actor
+        actor.eval()
+
+        def policy(world_state, scenario_state, config, actor=actor):
+            with torch.no_grad():
+                return actor(scenario.observe(world_state, scenario_state, config)).clamp(-1.0, 1.0)
+
+        result = evaluate(cfg, policy)
+        actor.train()
+        return result.as_log()
 
     # ------------------------------------------------------------ checkpoints
 

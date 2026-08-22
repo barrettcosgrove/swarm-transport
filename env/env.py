@@ -70,7 +70,7 @@ class Env:
         current_payload_dist = torch.norm(self.world_state.payload_pos - self.scenario_state.goal_pos , dim=-1)
         current_agent_pushpoint_dist = scenario.agent_pushpoint_geometry(
             self.world_state.agent_pos, self.world_state.payload_pos,
-            self.scenario_state.goal_pos, self.config.push_standoff)
+            self.scenario_state.goal_pos, self.config.approach_target_standoff)
         self.scenario_state = dataclasses.replace(
             self.scenario_state,
             step_count=self.scenario_state.step_count + 1,

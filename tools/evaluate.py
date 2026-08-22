@@ -14,6 +14,10 @@ distribution but left its shape alone, so the p95 stayed near 3x the median at
 every scale. A flat drain reads as a tail ratio of 1.0, which is the quickest
 confirmation that health has become a predictable budget rather than a lottery.
 
+Behavioural fields (position_ratio, push_efficiency, payload progress, predator
+distance) use the same helpers as train/mappo.py so a periodic eval and an
+iteration record cannot disagree on the metrics that gate the next change.
+
 Usage:
     from tools.evaluate import evaluate, format_report
     print(format_report(evaluate(config, policy)))
@@ -33,12 +37,22 @@ class EvalResult:
     timeouts: int
     episodes: int
     win_rate: float
+    capture_rate: float
+    timeout_rate: float
     mean_episode_steps: float
+    mean_win_steps: float
+    mean_capture_steps: float
+    mean_timeout_steps: float
     damage_events: int
     damage_median: float
     damage_p95: float
     damage_max: float
-    end_health: float
+    mean_end_health: float
+    position_ratio: float
+    push_efficiency: float
+    mean_payload_progress: float
+    mean_min_predator_dist: float
+    mean_team_spread: float
 
     @property
     def damage_tail_ratio(self) -> float:
@@ -47,6 +61,33 @@ class EvalResult:
         if self.damage_median <= 0.0:
             return float("nan")
         return self.damage_p95 / self.damage_median
+
+    def as_log(self):
+        """Flat dict for the training JSON, prefixed so it cannot collide with
+        the noisier per-iteration success_rate from the rollout."""
+        return {
+            "eval_win_rate": self.win_rate,
+            "eval_capture_rate": self.capture_rate,
+            "eval_timeout_rate": self.timeout_rate,
+            "eval_wins": self.wins,
+            "eval_captures": self.captures,
+            "eval_timeouts": self.timeouts,
+            "eval_episodes": self.episodes,
+            "eval_mean_episode_steps": self.mean_episode_steps,
+            "eval_mean_win_steps": self.mean_win_steps,
+            "eval_mean_capture_steps": self.mean_capture_steps,
+            "eval_mean_timeout_steps": self.mean_timeout_steps,
+            "eval_mean_end_health": self.mean_end_health,
+            "eval_position_ratio": self.position_ratio,
+            "eval_push_efficiency": self.push_efficiency,
+            "eval_mean_payload_progress": self.mean_payload_progress,
+            "eval_mean_min_predator_dist": self.mean_min_predator_dist,
+            "eval_mean_team_spread": self.mean_team_spread,
+        }
+
+
+def _mean(values):
+    return sum(values) / len(values) if values else float("nan")
 
 
 def evaluate(config, policy, seeds=(0, 1, 2), n_steps=None):
@@ -61,17 +102,25 @@ def evaluate(config, policy, seeds=(0, 1, 2), n_steps=None):
     from the tally.
     """
     from env.env import Env
+    from env import scenario
 
     n_steps = n_steps or 2 * config.max_steps
     wins = captures = timeouts = 0
-    episode_lengths = []
+    win_lengths, capture_lengths, timeout_lengths = [], [], []
     damage = []
     end_health = []
+    payload_progress = []
+    behind = front = 0
+    force_goal = force_mag = 0.0
+    pred_sum = spread_sum = 0.0
+    n_beh = 0
 
     for seed in seeds:
         cfg = dataclasses.replace(config, seed=seed)
         env = Env(cfg)
         env.reset()
+        start_dist = torch.norm(
+            env.world_state.payload_pos - env.scenario_state.goal_pos, dim=-1)
 
         for _ in range(n_steps):
             world_state, scenario_state = env.world_state, env.scenario_state
@@ -80,19 +129,44 @@ def evaluate(config, policy, seeds=(0, 1, 2), n_steps=None):
             actions = policy(world_state, scenario_state, cfg)
             _, _, terminated, truncated, info = env.step(actions, training_progress=1.0)
 
+            ws = info["world_state"]
+            ss = info["scenario_state"]
+            behind_mask, front_mask = scenario.payload_side_masks(
+                ws, ss, cfg.push_zone_radius)
+            behind += int(behind_mask.sum())
+            front += int(front_mask.sum())
+            goalward, magnitude = scenario.payload_goalward_force(ws, ss, cfg)
+            force_goal += goalward.sum().item()
+            force_mag += magnitude.sum().item()
+            pred_sum += (ws.agent_pos - ws.predator_pos.unsqueeze(1)).norm(dim=-1).min(-1).values.sum().item()
+            centroid = ws.agent_pos.mean(dim=1, keepdim=True)
+            spread_sum += (ws.agent_pos - centroid).norm(dim=-1).mean(-1).sum().item()
+            n_beh += ws.payload_pos.shape[0]
+
             at_goal = info["success"]
-            wins += int((terminated & at_goal).sum())
-            captures += int((terminated & ~at_goal).sum())
-            timeouts += int((truncated & ~terminated).sum())
+            win_mask = terminated & at_goal
+            cap_mask = terminated & ~at_goal
+            to_mask = truncated & ~terminated
+            wins += int(win_mask.sum())
+            captures += int(cap_mask.sum())
+            timeouts += int(to_mask.sum())
 
             ended = terminated | truncated
             if bool(ended.any()):
-                episode_lengths += info["scenario_state"].step_count[ended].tolist()
+                steps = info["scenario_state"].step_count
+                win_lengths += steps[win_mask].tolist()
+                capture_lengths += steps[cap_mask].tolist()
+                timeout_lengths += steps[to_mask].tolist()
+                end_health += ss.health[ended].tolist()
+                payload_progress += (start_dist[ended] - info["payload_dist"][ended]).tolist()
+                start_dist = torch.where(
+                    ended,
+                    torch.norm(env.world_state.payload_pos - env.scenario_state.goal_pos, dim=-1),
+                    start_dist,
+                )
 
-            lost = health_before - info["scenario_state"].health
+            lost = health_before - ss.health
             damage += lost[lost > 0].tolist()
-
-        end_health.append(float(env.scenario_state.health.mean()))
 
     episodes = wins + captures + timeouts
     d = torch.tensor(damage) if damage else torch.zeros(1)
@@ -103,24 +177,38 @@ def evaluate(config, policy, seeds=(0, 1, 2), n_steps=None):
         timeouts=timeouts,
         episodes=episodes,
         win_rate=wins / episodes if episodes else 0.0,
-        mean_episode_steps=sum(episode_lengths) / len(episode_lengths) if episode_lengths else float("nan"),
+        capture_rate=captures / episodes if episodes else 0.0,
+        timeout_rate=timeouts / episodes if episodes else 0.0,
+        mean_episode_steps=_mean(win_lengths + capture_lengths + timeout_lengths),
+        mean_win_steps=_mean(win_lengths),
+        mean_capture_steps=_mean(capture_lengths),
+        mean_timeout_steps=_mean(timeout_lengths),
         damage_events=len(damage),
         damage_median=float(d.median()),
         damage_p95=float(d.quantile(0.95)),
         damage_max=float(d.max()),
-        end_health=sum(end_health) / len(end_health),
+        mean_end_health=_mean(end_health),
+        position_ratio=behind / max(front, 1),
+        push_efficiency=force_goal / force_mag if force_mag else 0.0,
+        mean_payload_progress=_mean(payload_progress),
+        mean_min_predator_dist=pred_sum / n_beh if n_beh else float("nan"),
+        mean_team_spread=spread_sum / n_beh if n_beh else float("nan"),
     )
 
 
-HEADER = (f"{'variant':<34}{'win%':>6}{'win':>5}{'cap':>5}{'time':>6}"
-          f"{'len':>7}{'dmg med':>9}{'p95':>7}{'max':>7}{'tail':>6}")
+HEADER = (f"{'variant':<28}{'win%':>6}{'cap%':>6}{'to%':>6}"
+          f"{'win':>5}{'cap':>5}{'to':>5}{'len':>6}"
+          f"{'posR':>6}{'pshE':>6}{'prog':>7}{'pred':>6}{'hp':>6}")
 
 
 def format_report(result, label=""):
-    return (f"{label:<34}{result.win_rate:>5.0%}{result.wins:>5}{result.captures:>5}"
-            f"{result.timeouts:>6}{result.mean_episode_steps:>7.0f}"
-            f"{result.damage_median:>9.1f}{result.damage_p95:>7.1f}"
-            f"{result.damage_max:>7.1f}{result.damage_tail_ratio:>6.1f}")
+    return (f"{label:<28}{result.win_rate:>5.0%}{result.capture_rate:>5.0%}{result.timeout_rate:>5.0%}"
+            f"{result.wins:>5}{result.captures:>5}{result.timeouts:>5}"
+            f"{result.mean_episode_steps:>6.0f}"
+            f"{result.position_ratio:>6.2f}{result.push_efficiency:>6.1%}"
+            f"{result.mean_payload_progress:>7.2f}"
+            f"{result.mean_min_predator_dist:>6.2f}"
+            f"{result.mean_end_health:>6.0f}")
 
 
 if __name__ == "__main__":
@@ -129,7 +217,7 @@ if __name__ == "__main__":
     from train.checkpoints import load_checkpoint
     from train.mappo import Actor, Critic
 
-    CHECKPOINT = "train/checkpoints/preview_100_approach_push_proximity/checkpoint_100.pt"
+    CHECKPOINT = "train/checkpoints/full_250_push_reversion/checkpoint_250.pt"
 
     config = Config(num_envs=16)
     actor = Actor(config.obs_dim, 2, config.hidden_dim)
@@ -142,4 +230,4 @@ if __name__ == "__main__":
             return actor(scenario.observe(world_state, scenario_state, cfg)).clamp(-1.0, 1.0)
 
     print(HEADER)
-    print(format_report(evaluate(config, actor_policy), "preview_100_approach_push_proximity"))
+    print(format_report(evaluate(config, actor_policy), "full_250_push_reversion"))

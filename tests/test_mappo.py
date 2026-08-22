@@ -46,6 +46,7 @@ def make_test_config(num_envs=4, n_agents=5, rollout_steps=8, max_steps=50, **ov
         "update_epochs": 2,
         "minibatch_size": num_envs * n_agents * rollout_steps // 2,
         "seed": 0,
+        "eval_interval": 0,
     }
     settings.update(overrides)
     return dataclasses.replace(Config(), **settings)
@@ -64,7 +65,7 @@ def test_dimensions_match_the_documented_values():
     config = Config()
     assert config.obs_dim == 32
     assert config.state_dim == 165
-    assert config.rollout_steps * config.num_envs * config.n_agents == 40_960
+    assert config.rollout_steps * config.num_envs * config.n_agents == 81_920
 
 
 def test_one_iteration_produces_the_expected_shapes():
@@ -98,10 +99,16 @@ def test_one_iteration_produces_the_expected_shapes():
 
     assert {"episodes_completed", "success_rate", "capture_rate", "timeout_rate"} <= set(outcomes)
     for key in ("mean_episode_length", "mean_team_spread", "mean_min_predator_dist",
-                "mean_push_events",
+                "mean_push_events", "mean_contact_cosine", "mean_push_abs",
+                "mean_push_signed", "mean_agent_payload_dist",
+                "position_ratio", "push_efficiency",
                 "reward_progress", "reward_health", "reward_threat", "reward_push"):
         assert key in outcomes, f"outcomes is missing {key}"
     assert 0.0 <= outcomes["mean_push_events"] <= config.n_agents
+    assert -1.0 <= outcomes["mean_contact_cosine"] <= 1.0
+    assert outcomes["mean_push_abs"] >= 0.0
+    assert abs(outcomes["mean_push_signed"]) <= outcomes["mean_push_abs"] + 1e-7
+    assert outcomes["mean_agent_payload_dist"] >= 0.0
 
 
 def test_actor_never_sees_more_than_its_own_observation():
@@ -424,7 +431,10 @@ def test_short_training_run_is_finite_and_writes_its_log():
     assert len(history) == 3
     for record in history:
         for key in ("policy_loss", "value_loss", "entropy", "approx_kl", "clip_fraction",
-                    "mean_action_std", "mean_episode_return", "learning_rate"):
+                    "mean_action_std", "mean_episode_return", "learning_rate",
+                    "mean_contact_cosine", "mean_push_abs", "mean_push_signed",
+                    "mean_agent_payload_dist", "position_ratio", "push_efficiency",
+                    "advantage_private_fraction"):
             assert key in record, f"the log is missing {key}"
             assert math.isfinite(record[key]), f"{key} is not finite"
         assert record["state_dim"] == config.state_dim
@@ -466,6 +476,29 @@ def test_preview_stops_early_without_compressing_or_annealing_learning_rate():
     assert all(record["learning_rate"] == config.lr for record in history)
     assert os.path.exists(f"{config.checkpoint_dir}/checkpoint_latest.pt")
     assert os.path.exists(f"{config.checkpoint_dir}/checkpoint_3.pt")
+
+    shutil.rmtree(config.checkpoint_dir)
+    os.remove(config.log_path)
+
+
+def test_periodic_eval_writes_checkpoint_best_and_outcome_rates():
+    config = make_test_config(
+        rollout_steps=8, max_steps=20, num_iterations=1,
+        eval_interval=1, eval_num_envs=2,
+        log_path="outputs/_test_eval.json",
+        checkpoint_dir="train/checkpoints/_test_eval",
+    )
+    history = MAPPOTrainer(config).train(verbose=False)
+    record = history[0]
+    for key in ("eval_win_rate", "eval_capture_rate", "eval_timeout_rate",
+                "eval_position_ratio", "eval_push_efficiency",
+                "eval_mean_payload_progress", "eval_mean_end_health"):
+        assert key in record, f"eval log is missing {key}"
+        assert math.isfinite(record[key]) or key.endswith("steps"), f"{key} is not finite"
+    rates = record["eval_win_rate"] + record["eval_capture_rate"] + record["eval_timeout_rate"]
+    if record["eval_episodes"]:
+        assert abs(rates - 1.0) < 1e-6
+    assert os.path.exists(f"{config.checkpoint_dir}/checkpoint_best.pt")
 
     shutil.rmtree(config.checkpoint_dir)
     os.remove(config.log_path)

@@ -110,7 +110,7 @@ def reset(num_envs, config, generator) -> (WorldState, ScenarioState):
     )
 
     agent_pushpoint_dist = agent_pushpoint_geometry(
-        agent_pos, payload_pos, goal_pos, config.push_standoff)
+        agent_pos, payload_pos, goal_pos, config.approach_target_standoff)
 
     scenario_state = ScenarioState(
         goal_pos=goal_pos,
@@ -223,11 +223,50 @@ def agent_pushpoint_geometry(agent_pos, payload_pos, goal_pos, standoff):
     center -- so closing this distance and being usefully positioned are the
     same thing.
     """
-    goal_dir = goal_pos - payload_pos
-    goal_dir = goal_dir / goal_dir.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+    to_goal = goal_pos - payload_pos
+    goal_dir = to_goal / to_goal.norm(dim=-1, keepdim=True).clamp(min=1e-6)
     push_point = payload_pos - goal_dir * standoff          # (E, 2)
     dist = (push_point.unsqueeze(1) - agent_pos).norm(dim=-1)  # (E, n_agents)
     return dist
+
+
+def payload_side_masks(world_state, scenario_state, zone_radius):
+    """Agents inside ``zone_radius`` of the payload, split by side of the goal line.
+
+    Behind is cosine < -0.4 (the push side). Front is cosine > 0.4 (blocking).
+    Shared by the trainer log and tools.evaluate so the two reports cannot
+    drift apart on the metric that gates the reward change.
+    """
+    rel = world_state.agent_pos - world_state.payload_pos.unsqueeze(1)
+    dist = rel.norm(dim=-1)
+    goal_dir = scenario_state.goal_pos - world_state.payload_pos
+    goal_dir = goal_dir / goal_dir.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+    side = (rel * goal_dir.unsqueeze(1)).sum(-1) / dist.clamp(min=1e-6)
+    in_zone = dist <= zone_radius
+    return in_zone & (side < -0.4), in_zone & (side > 0.4)
+
+
+def payload_goalward_force(world_state, scenario_state, config):
+    """Net agent force on the payload, projected onto the goal direction.
+
+    Returns ``(goalward, magnitude)``, both (E,). Efficiency is their ratio.
+    """
+    _, force_on_payload = circle_box_dynamic_forces(
+        world_state.agent_pos, world_state.agent_radius,
+        world_state.payload_pos, world_state.payload_halfsize, config.payload_stiffness)
+    goal_dir = scenario_state.goal_pos - world_state.payload_pos
+    goal_dir = goal_dir / goal_dir.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+    return (force_on_payload * goal_dir).sum(-1), force_on_payload.norm(dim=-1)
+
+
+def goalward_push_penetration(world_state, scenario_state, config) -> torch.Tensor:
+    """Signed contact penetration toward the goal, before ``push_coef``."""
+    force_on_agent, _ = circle_box_dynamic_forces(
+        world_state.agent_pos, world_state.agent_radius,
+        world_state.payload_pos, world_state.payload_halfsize, config.payload_stiffness)
+    goal_dir = scenario_state.goal_pos - world_state.payload_pos
+    goal_dir = goal_dir / goal_dir.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+    return ((-force_on_agent) * goal_dir.unsqueeze(1)).sum(-1) / config.payload_stiffness
 
 
 def reward_terms(world_state, scenario_state, training_progress, config) -> dict[str, torch.Tensor]:
@@ -258,15 +297,21 @@ def reward_terms(world_state, scenario_state, training_progress, config) -> dict
     success = curr_payload_dist < config.success_threshold
     success_reward = (success.float() * config.success_reward).unsqueeze(1).expand(E, config.n_agents)
 
-    # PRIVATE, ANNEALED: distance closed toward the standoff point. Job is
-    # purely to get an agent from spawn into pushing position. Goes silent
-    # once an agent is holding the point (target moves with the payload), so
-    # it cannot reward sustained pushing -- that is push_reward's job below.
+    # PRIVATE: distance closed toward the standoff point. Job is purely to get
+    # an agent from spawn into pushing position. Goes silent once an agent is
+    # holding the point (target moves with the payload), so it cannot reward
+    # sustained pushing -- that is push_reward's job below. Anneals when
+    # approach_anneal_fraction > 0; 0.0 keeps the coefficient at start for the
+    # whole run, which is the schedule that taught return-to-the-box.
     curr_pushpoint_dist = agent_pushpoint_geometry(
         world_state.agent_pos, world_state.payload_pos,
-        scenario_state.goal_pos, config.push_standoff)
-    approach_anneal = min(training_progress / config.approach_anneal_fraction, 1.0)
-    approach_coef = config.approach_coef_start * (1 - approach_anneal)
+        scenario_state.goal_pos, config.approach_target_standoff)
+    if config.approach_anneal_fraction <= 0.0:
+        approach_coef = config.approach_coef_start
+    else:
+        approach_anneal = min(training_progress / config.approach_anneal_fraction, 1.0)
+        approach_coef = config.approach_coef_start * (1 - approach_anneal)
+    
     approach_reward = approach_coef * (
         scenario_state.prev_agent_pushpoint_dist - curr_pushpoint_dist)
 
@@ -275,12 +320,7 @@ def reward_terms(world_state, scenario_state, training_progress, config) -> dict
     # farmed by hovering at the push point. Positive only while this agent's
     # contact is actually moving the payload toward the goal. This is the
     # term that pays during sustained pushing, which approach_reward cannot.
-    force_on_agent, _ = circle_box_dynamic_forces(
-        world_state.agent_pos, world_state.agent_radius,
-        world_state.payload_pos, world_state.payload_halfsize, config.payload_stiffness)
-    goal_dir = scenario_state.goal_pos - world_state.payload_pos
-    goal_dir = goal_dir / goal_dir.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-    push = ((-force_on_agent) * goal_dir.unsqueeze(1)).sum(-1) / config.payload_stiffness
+    push = goalward_push_penetration(world_state, scenario_state, config)
     push_reward = config.push_coef * push
 
     # PRIVATE: each agent's own distance to the predator. Zero beyond

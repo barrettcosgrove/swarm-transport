@@ -5,12 +5,12 @@ import torch
 class Config:
     # environment
     device: str = "cpu"
-    num_envs: int = 64
+    num_envs: int = 128
     n_agents: int = 5
     # tools/calibrate.py recommends 486 for the DESIGN 50-70% traversal target.
     # Held deliberately slack while the scripted controller is still marginal,
     # so failures read as "couldn't do it" rather than "ran out of clock".
-    max_steps: int = 600
+    max_steps: int = 900
     dt: float = 0.05
 
     # sizes and masses
@@ -168,25 +168,31 @@ class Config:
     success_threshold: float = 0.75
     success_reward: float = 450.0
     approach_coef_start: float = 8.0
-    # the fraction of training over which the coefficient decays linearly to
-    # zero: coef = start * (1 - min(progress / fraction, 1)). Anything above 1.0
-    # never finishes, leaving a permanent floor of start * (1 - 1/fraction) --
-    # at the 5.0 this used to hold, 8.0 only ever reached 6.4, so the crutch
-    # never came off and approach went on pulling all n_agents onto the same
-    # standoff point for the whole run.
-    approach_anneal_fraction: float = 0.6
+    # 0.0 is a sentinel: scenario.reward_terms keeps approach_coef at start for
+    # the whole run. A decaying schedule taught flee-and-stay-gone (the 400-run
+    # annealed this off at 0.6 of training and finished at ~12% success / ~88%
+    # timeouts). A constant 8.0 taught return-to-the-box (the 250-run, 55% eval
+    # wins). Values in (0, 1] still anneal linearly to zero; anything above 1.0
+    # never finishes and leaves a floor of start * (1 - 1/fraction).
+    approach_anneal_fraction: float = 0.0
     # This agent's own contact force on the payload, projected onto the goal
     # direction and divided by payload_stiffness so the scale is penetration
     # depth. Zero with no overlap -- cannot be farmed by hovering at the push
     # point. Does not anneal: this is the term that pays during sustained
     # pushing, which approach_reward cannot (the standoff point translates with
     # the payload, so an agent holding it closes nothing). 8.0 matches
-    # approach_coef_start.
+    # approach_coef_start. A bounded contact-cosine at 0.30/0.15 glued agents
+    # to the crate (eval 55% -> 23% -> 16%); this quieter form is the 55% recipe.
     push_coef: float = 8.0
     # Staging offset behind the payload, along the payload->goal line. Default is
     # payload_halfsize.max() + agent_radius + 0.15, the same number the scripted
     # controller already used inline.
     push_standoff: float = 0.45
+    approach_target_standoff: float = 0.3
+    # Radius used by position_ratio (trainer log and tools.evaluate). Strict
+    # contact is only 1-4% of steps; 0.5 is the band the diagnosis measured
+    # against. Not consumed by compute_reward until progress is attributed.
+    push_zone_radius: float = 0.5
     # Kept so the anneal invariant still has something to check, but no longer
     # consumed by compute_reward: a telescoping cosine summed to ~0 over a run
     # and could not teach a standing push. That job is push_coef above.
@@ -233,7 +239,7 @@ class Config:
     threat_coef: float = 0.10
     # 15 events at 40 steps each = 600 steps of life, against ~340 for a
     # traversal. At 100 the budget was 260 and arrival was impossible.
-    max_health: float = 100.0
+    max_health: float = 150.0
 
     # observation scaling. Positions / 8.5 maps the arena inner faces to
     # [-1, 1]; velocities / 5.0 maps ordinary motion similarly. Offsets are
@@ -249,9 +255,9 @@ class Config:
     ent_coefficient: float = 0.001
     rollout_steps: int = 128
     update_epochs: int = 10
-    # T=128 * E=64 * N=5 = 40,960 samples an iteration, so this is 10
+    # T=128 * E=128 * N=5 = 81,920 samples an iteration, so this is 20
     # minibatches per epoch. The MAPPO paper finds heavy minibatch splitting
-    # costs performance and stability; 20480 (2 minibatches) is the obvious
+    # costs performance and stability; 20480 (4 minibatches) is the obvious
     # one-variable experiment if value loss will not settle.
     minibatch_size: int = 4096
     num_iterations: int = 400
@@ -269,6 +275,10 @@ class Config:
     checkpoint_interval: int = 25
     checkpoint_dir: str = "train/checkpoints"
     log_path: str = "outputs/training_history.json"
+    # Periodic blocking eval for checkpoint_best.pt. 0 disables it. 100 is
+    # 4 * checkpoint_interval, so a 250-run evals three times including the end.
+    eval_interval: int = 100
+    eval_num_envs: int = 16
     
     # seed
     seed: int = 0
