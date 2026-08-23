@@ -189,10 +189,20 @@ class Config:
     # controller already used inline.
     push_standoff: float = 0.45
     approach_target_standoff: float = 0.3
-    # Radius used by position_ratio (trainer log and tools.evaluate). Strict
-    # contact is only 1-4% of steps; 0.5 is the band the diagnosis measured
-    # against. Not consumed by compute_reward until progress is attributed.
+    # Radius used by position_ratio and by progress attribution. Strict contact
+    # is only 1-4% of steps; 0.5 is the band the diagnosis measured against.
     push_zone_radius: float = 0.5
+    # How much of a payload-progress event is billed to agents inside
+    # push_zone_radius, with the remainder still shared by the team.
+    #
+    # A wholly shared progress term is why no agent learned side selection:
+    # the pusher and the blocker received the same number at the same
+    # timestep. Unlike health blame this private share IS split among the
+    # agents in the zone, so the team total stays equal to the old shared
+    # term and progress_coef does not need retuning. When nobody is in the
+    # zone the credited share is zero -- drift no agent caused is not blamed
+    # on anyone.
+    progress_blame_fraction: float = 0.7
     # Kept so the anneal invariant still has something to check, but no longer
     # consumed by compute_reward: a telescoping cosine summed to ~0 over a run
     # and could not teach a standing push. That job is push_coef above.

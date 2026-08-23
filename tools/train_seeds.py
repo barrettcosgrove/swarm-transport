@@ -3,14 +3,9 @@ tools/train_seeds.py
 
 Independent MAPPO runs across several seeds, written to one JSON.
 
-Each seed is a fresh Env / actor / critic / optimizer. The file is a list of
-{"seed": int, "iterations": [record, ...]} objects -- the same per-iteration
-records a single run would log, grouped by seed. Rewritten every 10 iterations
-of the current seed, so a crash still keeps completed seeds and the in-progress
-seed so far.
-
-This is the matched 250-iteration control on the current reward. Do not compare
-it to a 400-iteration run: num_iterations is the LR-anneal denominator.
+This is variant A: zone-attributed progress (progress_blame_fraction 0.7),
+same 250-iteration / 3-seed protocol as the control. Do not point it at
+outputs/control_250.json -- that log is the matched baseline.
 
 Usage:
     python -m tools.train_seeds
@@ -24,8 +19,8 @@ from train.mappo import MAPPOTrainer
 
 
 SEEDS = (0, 1, 2)
-LOG_PATH = "outputs/control_250.json"
-CHECKPOINT_DIR = "train/checkpoints/control_250"
+LOG_PATH = "outputs/variant_a_progress_blame.json"
+CHECKPOINT_DIR = "train/checkpoints/variant_a_progress_blame"
 
 
 def main():

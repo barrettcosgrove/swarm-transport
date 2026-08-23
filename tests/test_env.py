@@ -335,6 +335,61 @@ def test_health_loss_blame_falls_on_the_agent_in_range():
     assert torch.allclose(reward[0, 2], torch.tensor(-3.0), atol=1e-5)
 
 
+def test_progress_blame_falls_on_agents_in_the_push_zone():
+    """A shared progress term cannot teach side selection: every agent gets
+    the same number whether it is shoving the crate or standing in its path.
+    The credited share has to land on agents inside push_zone_radius, and
+    the team total has to match the old shared term so progress_coef stays
+    put. When nobody is in the zone the credited share is zero.
+    """
+    config = dataclasses.replace(
+        make_test_config(num_envs=1, n_agents=3),
+        progress_coef=50.0, time_penalty_coef=0.0, success_reward=0.0,
+        approach_coef_start=0.0, alignment_coef_start=0.0,
+        captured_reward=0.0, collision_coef=0.0, threat_coef=0.0,
+        push_coef=0.0, health_loss_coef=0.0,
+        progress_blame_fraction=0.7, push_zone_radius=0.5,
+    )
+    generator = torch.Generator().manual_seed(0)
+    world_state, scenario_state = scenario.reset(1, config, generator)
+    payload = torch.tensor([[0.0, 0.0]])
+    goal = torch.tensor([[5.0, 0.0]])
+    world_state = dataclasses.replace(
+        world_state, payload_pos=payload,
+        predator_pos=torch.tensor([[50.0, 50.0]]),
+        obstacle_center=torch.full_like(world_state.obstacle_center, 1e6),
+    )
+    # one step of progress of 0.1 -> team total 50 * 0.1 * 3 = 15
+    scenario_state = dataclasses.replace(
+        scenario_state, goal_pos=goal, prev_payload_dist=torch.tensor([5.1]))
+
+    far = torch.tensor([10.0, 10.0])
+    near = torch.tensor([-0.4, 0.0])
+    one_in_zone = dataclasses.replace(
+        world_state, agent_pos=torch.tensor([[near.tolist(), far.tolist(), far.tolist()]]))
+    reward = scenario.reward_terms(one_in_zone, scenario_state, 0.0, config)["progress"]
+    # in-zone: 0.3 * 5 + 0.7 * 5 * 3 / 1 = 1.5 + 10.5 = 12
+    # others:  0.3 * 5 = 1.5
+    assert torch.allclose(reward[0, 0], torch.tensor(12.0), atol=1e-5)
+    assert torch.allclose(reward[0, 1:], torch.full((2,), 1.5), atol=1e-5)
+    assert torch.allclose(reward.sum(), torch.tensor(15.0), atol=1e-5)
+
+    two_in_zone = dataclasses.replace(
+        world_state,
+        agent_pos=torch.tensor([[near.tolist(), [0.4, 0.0], far.tolist()]]),
+    )
+    reward = scenario.reward_terms(two_in_zone, scenario_state, 0.0, config)["progress"]
+    # each in-zone: 0.3 * 5 + 0.7 * 5 * 3 / 2 = 1.5 + 5.25 = 6.75
+    assert torch.allclose(reward[0, :2], torch.full((2,), 6.75), atol=1e-5)
+    assert torch.allclose(reward[0, 2], torch.tensor(1.5), atol=1e-5)
+    assert torch.allclose(reward.sum(), torch.tensor(15.0), atol=1e-5)
+
+    nobody = dataclasses.replace(
+        world_state, agent_pos=torch.tensor([[far.tolist(), far.tolist(), far.tolist()]]))
+    reward = scenario.reward_terms(nobody, scenario_state, 0.0, config)["progress"]
+    assert torch.allclose(reward, torch.full((1, 3), 1.5), atol=1e-5)
+
+
 def test_threat_term_is_zero_outside_the_danger_radius_and_private():
     """The DESIGN.md objection to predator-distance shaping is a permanent
     gradient away from the payload. This term has to be exactly zero beyond

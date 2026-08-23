@@ -289,7 +289,17 @@ def reward_terms(world_state, scenario_state, training_progress, config) -> dict
 
     curr_payload_dist = torch.norm(world_state.payload_pos - scenario_state.goal_pos, dim=-1)
     progress = scenario_state.prev_payload_dist - curr_payload_dist
-    progress_reward = (config.progress_coef * progress).unsqueeze(1).expand(E, config.n_agents)
+    # SHARED + PRIVATE: the raw progress is a team outcome. Attribute most of
+    # it to agents inside push_zone_radius so a pusher and a blocker no longer
+    # receive the same number. Split among whoever is in the zone (unlike
+    # health, which is flat) so the team total matches the old shared term.
+    in_zone = ((world_state.agent_pos - world_state.payload_pos.unsqueeze(1))
+               .norm(dim=-1) <= config.push_zone_radius)
+    n_zone = in_zone.sum(-1, keepdim=True).clamp(min=1.0)
+    blame = config.progress_blame_fraction
+    shared = (1.0 - blame) * progress.unsqueeze(1).expand(E, config.n_agents)
+    credited = blame * progress.unsqueeze(1) * in_zone * config.n_agents / n_zone
+    progress_reward = config.progress_coef * (shared + credited)
     
     time_penalty = torch.full((E, config.n_agents), -config.time_penalty_coef,
                               device=world_state.agent_pos.device)

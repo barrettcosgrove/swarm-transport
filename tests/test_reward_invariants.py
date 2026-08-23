@@ -138,6 +138,7 @@ def test_blame_fraction_is_a_fraction():
     """
     config = Config()
     assert 0.0 <= config.health_loss_blame_fraction <= 1.0
+    assert 0.0 <= config.progress_blame_fraction <= 1.0
 
 
 def test_threat_zone_leaves_room_to_push():
