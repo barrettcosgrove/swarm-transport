@@ -141,10 +141,51 @@ def test_blame_fraction_is_a_fraction():
     assert 0.0 <= config.progress_blame_fraction <= 1.0
 
 
+def predator_spin_up_closure(config):
+    """Net ground a predator at its speed cap makes up while an agent
+    accelerates from rest against linear drag.
+
+    Same integration as tools/threat_calibrate.py. Finite because agent
+    thrust/drag is 20 against predator_max_speed 3.5 -- the agent eventually
+    outruns it, so only the spin-up window decides the outcome.
+    """
+    a = config.agent_max_thrust / config.agent_mass
+    k = config.agent_drag_coef / config.agent_mass
+    v = 0.0
+    closure = 0.0
+    worst = 0.0
+    for _ in range(200):
+        v = min(v + (a - k * v) * config.dt, config.agent_max_speed)
+        closure += (config.predator_max_speed - v) * config.dt
+        worst = max(worst, closure)
+    return worst
+
+
+def test_danger_radius_clears_the_spin_up_closure():
+    """An agent fleeing from rest loses ~1.209 units before it matches the
+    predator's speed cap. Any danger radius below capture + that closure is a
+    warning that arrives after capture is already committed -- the 1.0 radius
+    sat below this floor and evasion was not a behaviour the policy could
+    express.
+    """
+    config = Config()
+    floor = config.predator_capture_radius + predator_spin_up_closure(config)
+    assert config.predator_danger_radius > floor, (
+        f"predator_danger_radius {config.predator_danger_radius} is below the "
+        f"escape floor {floor:.3f}"
+    )
+
+
 def test_threat_zone_leaves_room_to_push():
     """The threat radius has to exceed the capture radius to be a warning rather
     than a synonym for the damage it is meant to pre-empt, and has to stay well
     inside the arena or it becomes the permanent repulsion DESIGN.md rejects.
+
+    The per-step bound is threat_coef against progress_coef * push_standoff.
+    At 1.0 vs 15 the margin is 15x -- still a reason to stay and push rather
+    than a standing order to leave the crate. The per-step test alone missed
+    variant B; test_threat_integral_stays_well_under_winning is the one that
+    would have caught the accumulating cost.
     """
     config = Config()
     assert config.predator_danger_radius > config.predator_capture_radius
@@ -154,4 +195,28 @@ def test_threat_zone_leaves_room_to_push():
     worst_case_per_step = config.threat_coef
     assert worst_case_per_step < config.progress_coef * push_standoff, (
         "threat term outweighs what pushing the payload can pay"
+    )
+
+
+# Fraction of agent-steps with nonzero closing-rate threat, measured by
+# tools/threat_calibrate.py against variant A at the eval horizon. Re-measure
+# whenever danger_radius or predator_max_speed change. This is a pessimistic
+# envelope -- most live steps pay a fraction of threat_coef -- so the
+# integral is an upper bound, not the realized episode sum.
+MEASURED_THREAT_DUTY = 0.3644
+
+
+def test_threat_integral_stays_well_under_winning():
+    """The distance-field form of variant B passed the per-step bound
+    (2.0 < 15) and still dominated the return: episode threat -138 against
+    success 450. Duty counts any nonzero step, so this envelope is loose;
+    a win is 450 and variant B's realized -138 already inverted the
+    objective. Requiring the envelope under one win is what would have
+    rejected that coefficient.
+    """
+    config = Config()
+    budget = config.max_steps * config.threat_coef * MEASURED_THREAT_DUTY
+    assert budget < config.success_reward, (
+        f"threat integral {budget:.1f} against success {config.success_reward}. "
+        f"Lower threat_coef or re-measure MEASURED_THREAT_DUTY"
     )

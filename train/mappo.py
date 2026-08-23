@@ -400,6 +400,8 @@ class TrainingLogger:
                 f"len {record['mean_episode_length']:>6.0f}  "
                 f"pos {record['position_ratio']:>5.2f}  "
                 f"peff {record['push_efficiency']:>5.1%}  "
+                f"eva {record['evade_cosine']:>5.2f}  "
+                f"thr {record['mean_threat_agents']:>4.2f}  "
                 f"pi {record['policy_loss']:>7.4f}  "
                 f"v {record['value_loss']:>9.3f}  "
                 f"ent {record['entropy']:>6.3f}  "
@@ -479,6 +481,8 @@ class MAPPOTrainer:
         agent_payload_dist_sum = 0.0
         behind_count = front_count = 0
         force_goal_sum = force_mag_sum = 0.0
+        evade_cosine_sum = evade_count = 0.0
+        threat_agents_sum = 0.0
         n_beh_steps = 0
 
         for step in range(self.config.rollout_steps):
@@ -494,6 +498,9 @@ class MAPPOTrainer:
             # storing the clamped one instead would make the ratio compare
             # log-probabilities of two different actions.
             clipped = action.clamp(-1.0, 1.0)
+            # evade_cosine has to be scored on the board the action was chosen
+            # against. info["world_state"] is post-step.
+            pre_ws = self.env.world_state
             next_obs, reward, terminated, truncated, info = self.env.step(clipped, training_progress)
 
             # terminated/truncated are per-environment; the buffer is per-agent
@@ -549,6 +556,11 @@ class MAPPOTrainer:
                 ws, info["scenario_state"], self.config)
             force_goal_sum += goalward.sum().item()
             force_mag_sum += magnitude.sum().item()
+            evade_cos, in_danger = scenario.predator_evade_masks(
+                pre_ws, clipped, self.config.predator_danger_radius)
+            evade_cosine_sum += evade_cos[in_danger].sum().item()
+            evade_count += int(in_danger.sum())
+            threat_agents_sum += (terms["threat"] != 0).float().sum(-1).mean().item()
             if self.config.push_coef:
                 push_penetration = terms["push"] / self.config.push_coef
             else:
@@ -609,6 +621,8 @@ class MAPPOTrainer:
             "mean_agent_payload_dist": agent_payload_dist_sum / n_beh_steps,
             "position_ratio": behind_count / max(front_count, 1),
             "push_efficiency": force_goal_sum / force_mag_sum if force_mag_sum else 0.0,
+            "evade_cosine": evade_cosine_sum / evade_count if evade_count else 0.0,
+            "mean_threat_agents": threat_agents_sum / n_beh_steps,
         }
         if self.episode_term_returns is not None:
             for name, values in self.episode_term_returns.items():

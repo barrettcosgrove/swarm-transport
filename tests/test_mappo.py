@@ -101,11 +101,14 @@ def test_one_iteration_produces_the_expected_shapes():
     for key in ("mean_episode_length", "mean_team_spread", "mean_min_predator_dist",
                 "mean_push_events", "mean_contact_cosine", "mean_push_abs",
                 "mean_push_signed", "mean_agent_payload_dist",
-                "position_ratio", "push_efficiency",
+                "position_ratio", "push_efficiency", "evade_cosine",
+                "mean_threat_agents",
                 "reward_progress", "reward_health", "reward_threat", "reward_push"):
         assert key in outcomes, f"outcomes is missing {key}"
     assert 0.0 <= outcomes["mean_push_events"] <= config.n_agents
     assert -1.0 <= outcomes["mean_contact_cosine"] <= 1.0
+    assert -1.0 <= outcomes["evade_cosine"] <= 1.0
+    assert 0.0 <= outcomes["mean_threat_agents"] <= config.n_agents
     assert outcomes["mean_push_abs"] >= 0.0
     assert abs(outcomes["mean_push_signed"]) <= outcomes["mean_push_abs"] + 1e-7
     assert outcomes["mean_agent_payload_dist"] >= 0.0
@@ -434,6 +437,7 @@ def test_short_training_run_is_finite_and_writes_its_log():
                     "mean_action_std", "mean_episode_return", "learning_rate",
                     "mean_contact_cosine", "mean_push_abs", "mean_push_signed",
                     "mean_agent_payload_dist", "position_ratio", "push_efficiency",
+                    "evade_cosine", "mean_threat_agents",
                     "advantage_private_fraction"):
             assert key in record, f"the log is missing {key}"
             assert math.isfinite(record[key]), f"{key} is not finite"
@@ -492,7 +496,8 @@ def test_periodic_eval_writes_checkpoint_best_and_outcome_rates():
     record = history[0]
     for key in ("eval_win_rate", "eval_capture_rate", "eval_timeout_rate",
                 "eval_position_ratio", "eval_push_efficiency",
-                "eval_mean_payload_progress", "eval_mean_end_health"):
+                "eval_mean_payload_progress", "eval_mean_end_health",
+                "eval_evade_cosine"):
         assert key in record, f"eval log is missing {key}"
         assert math.isfinite(record[key]) or key.endswith("steps"), f"{key} is not finite"
     rates = record["eval_win_rate"] + record["eval_capture_rate"] + record["eval_timeout_rate"]

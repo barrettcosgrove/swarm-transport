@@ -246,6 +246,40 @@ def payload_side_masks(world_state, scenario_state, zone_radius):
     return in_zone & (side < -0.4), in_zone & (side > 0.4)
 
 
+def predator_evade_masks(world_state, actions, danger_radius):
+    """cos(action, away from predator) and who is inside ``danger_radius``.
+
+    Sign is the whole question: negative means agents steer into the thing
+    damaging them, which is what variant A measured at -0.19. Shared by the
+    trainer log and tools.evaluate so the two reports cannot drift apart on
+    the metric that gates the evasion change.
+    """
+    to_pred = world_state.predator_pos.unsqueeze(1) - world_state.agent_pos
+    dist = to_pred.norm(dim=-1)
+    away = -to_pred / dist.unsqueeze(-1).clamp(min=1e-6)
+    cosine = (actions * away).sum(-1) / actions.norm(dim=-1).clamp(min=1e-6)
+    return cosine, dist <= danger_radius
+
+
+def predator_closing(world_state, config):
+    """Distance, intrusion in [0, 1], and closing rate in [0, 1].
+
+    Closing is the component of relative velocity along the line from agent
+    to predator, normalized by predator_max_speed. Zero when the gap is not
+    shrinking -- a hunter parked on the crate costs nothing. Shared by
+    reward_terms and tools/threat_calibrate so the sweep cannot drift from
+    the term it is sizing.
+    """
+    to_pred = world_state.predator_pos.unsqueeze(1) - world_state.agent_pos
+    dist = to_pred.norm(dim=-1)
+    unit = to_pred / dist.clamp(min=1e-6).unsqueeze(-1)
+    intrusion = ((config.predator_danger_radius - dist)
+                 .clamp(min=0.0) / config.predator_danger_radius)
+    rel_vel = world_state.predator_vel.unsqueeze(1) - world_state.agent_vel
+    closing = (-(rel_vel * unit).sum(-1)).clamp(min=0.0) / config.predator_max_speed
+    return dist, intrusion, closing.clamp(max=1.0)
+
+
 def payload_goalward_force(world_state, scenario_state, config):
     """Net agent force on the payload, projected onto the goal direction.
 
@@ -338,15 +372,16 @@ def reward_terms(world_state, scenario_state, training_progress, config) -> dict
     # standing reason to avoid the payload the predator guards. Squared so
     # both the value and its derivative vanish at the boundary.
     #
-    # Gated on cooldown: a cooling predator cannot deal damage, and billing
-    # threat through that window taught agents to freeze next to a harmless
-    # hunter instead of using the 40 steps to push.
-    dist_to_predator = torch.norm(
-        world_state.agent_pos - world_state.predator_pos.unsqueeze(1), dim=-1)
-    intrusion = ((config.predator_danger_radius - dist_to_predator)
-                 .clamp(min=0.0) / config.predator_danger_radius)
-    live = (scenario_state.predator_cooldown <= 0).unsqueeze(1)
-    threat_reward = -config.threat_coef * intrusion.pow(2) * live
+    # Gated on closing rate, not on cooldown or raw proximity. Variant B's
+    # distance field taxed anyone near a hunter that camps the crate, and
+    # the policy correctly left: episode threat -138 against progress +0.4,
+    # agent-payload distance 0.80 -> 2.44, health unchanged. Closing is
+    # zero while the predator is parked or moving away, so the push zone
+    # stays free; it fires only while the gap is shrinking. A cooling
+    # predator is already speed-capped at half, so the physics does the
+    # gating that threat_cooldown_factor used to.
+    dist_to_predator, intrusion, closing = predator_closing(world_state, config)
+    threat_reward = -config.threat_coef * intrusion.pow(2) * closing
 
     # SHARED + PRIVATE: update_health drains a flat health_loss_per_step on
     # any() over agents, so the pool itself does not know who was hit. This

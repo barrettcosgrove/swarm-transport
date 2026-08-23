@@ -53,6 +53,7 @@ class EvalResult:
     mean_payload_progress: float
     mean_min_predator_dist: float
     mean_team_spread: float
+    evade_cosine: float
 
     @property
     def damage_tail_ratio(self) -> float:
@@ -83,6 +84,7 @@ class EvalResult:
             "eval_mean_payload_progress": self.mean_payload_progress,
             "eval_mean_min_predator_dist": self.mean_min_predator_dist,
             "eval_mean_team_spread": self.mean_team_spread,
+            "eval_evade_cosine": self.evade_cosine,
         }
 
 
@@ -113,6 +115,7 @@ def evaluate(config, policy, seeds=(0, 1, 2), n_steps=None):
     behind = front = 0
     force_goal = force_mag = 0.0
     pred_sum = spread_sum = 0.0
+    evade_cosine_sum = evade_count = 0.0
     n_beh = 0
 
     for seed in seeds:
@@ -127,6 +130,10 @@ def evaluate(config, policy, seeds=(0, 1, 2), n_steps=None):
             health_before = scenario_state.health.clone()
 
             actions = policy(world_state, scenario_state, cfg)
+            evade_cos, in_danger = scenario.predator_evade_masks(
+                world_state, actions, cfg.predator_danger_radius)
+            evade_cosine_sum += evade_cos[in_danger].sum().item()
+            evade_count += int(in_danger.sum())
             _, _, terminated, truncated, info = env.step(actions, training_progress=1.0)
 
             ws = info["world_state"]
@@ -193,12 +200,13 @@ def evaluate(config, policy, seeds=(0, 1, 2), n_steps=None):
         mean_payload_progress=_mean(payload_progress),
         mean_min_predator_dist=pred_sum / n_beh if n_beh else float("nan"),
         mean_team_spread=spread_sum / n_beh if n_beh else float("nan"),
+        evade_cosine=evade_cosine_sum / evade_count if evade_count else 0.0,
     )
 
 
 HEADER = (f"{'variant':<28}{'win%':>6}{'cap%':>6}{'to%':>6}"
           f"{'win':>5}{'cap':>5}{'to':>5}{'len':>6}"
-          f"{'posR':>6}{'pshE':>6}{'prog':>7}{'pred':>6}{'hp':>6}")
+          f"{'posR':>6}{'pshE':>6}{'prog':>7}{'pred':>6}{'eva':>6}{'hp':>6}")
 
 
 def format_report(result, label=""):
@@ -208,6 +216,7 @@ def format_report(result, label=""):
             f"{result.position_ratio:>6.2f}{result.push_efficiency:>6.1%}"
             f"{result.mean_payload_progress:>7.2f}"
             f"{result.mean_min_predator_dist:>6.2f}"
+            f"{result.evade_cosine:>6.2f}"
             f"{result.mean_end_health:>6.0f}")
 
 
@@ -217,7 +226,7 @@ if __name__ == "__main__":
     from train.checkpoints import load_checkpoint
     from train.mappo import Actor, Critic
 
-    CHECKPOINT = "train/checkpoints/variant_a_progress_blame/seed_2/checkpoint_best.pt"
+    CHECKPOINT = "train/checkpoints/variant_c_closing_threat/seed_2/checkpoint_best.pt"
 
     config = Config(num_envs=16)
     actor = Actor(config.obs_dim, 2, config.hidden_dim)
@@ -230,4 +239,4 @@ if __name__ == "__main__":
             return actor(scenario.observe(world_state, scenario_state, cfg)).clamp(-1.0, 1.0)
 
     print(HEADER)
-    print(format_report(evaluate(config, actor_policy), "variant_a_progress_blame/seed_2"))
+    print(format_report(evaluate(config, actor_policy), "variant_c_closing_threat/seed_2"))

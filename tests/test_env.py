@@ -394,7 +394,9 @@ def test_threat_term_is_zero_outside_the_danger_radius_and_private():
     """The DESIGN.md objection to predator-distance shaping is a permanent
     gradient away from the payload. This term has to be exactly zero beyond
     its radius, and it has to be private -- agent 0 next to the predator
-    cannot change agent 1's penalty.
+    cannot change agent 1's penalty. Closing-rate gating also requires a
+    full-speed approach to reach -threat_coef; a parked hunter at the same
+    spot pays nothing.
     """
     config = dataclasses.replace(
         make_test_config(num_envs=1, n_agents=2),
@@ -402,23 +404,31 @@ def test_threat_term_is_zero_outside_the_danger_radius_and_private():
         approach_coef_start=0.0, alignment_coef_start=0.0,
         health_loss_coef=0.0, captured_reward=0.0, collision_coef=0.0,
         threat_coef=0.3, predator_danger_radius=1.0, push_coef=0.0,
+        predator_max_speed=3.5,
     )
     generator = torch.Generator().manual_seed(0)
     world_state, scenario_state = scenario.reset(1, config, generator)
 
-    agent_pos = world_state.agent_pos.clone()
-    # agent 0 at the predator, agent 1 well outside the zone
-    agent_pos[0, 0] = world_state.predator_pos[0]
-    agent_pos[0, 1] = world_state.predator_pos[0] + 5.0
-    world_state = dataclasses.replace(world_state, agent_pos=agent_pos)
+    pred = torch.tensor([[0.0, 0.0]])
+    # agent 0 almost on the predator (intrusion ~ 1), agent 1 well outside
+    agent_pos = torch.tensor([[[1e-4, 0.0], [5.0, 0.0]]])
+    predator_vel = torch.tensor([[config.predator_max_speed, 0.0]])
+    world_state = dataclasses.replace(
+        world_state,
+        predator_pos=pred,
+        agent_pos=agent_pos,
+        predator_vel=predator_vel,
+        agent_vel=torch.zeros_like(agent_pos),
+    )
 
     terms = scenario.reward_terms(world_state, scenario_state, 0.0, config)
     threat = terms["threat"]
-    assert torch.allclose(threat[0, 0], torch.tensor(-config.threat_coef), atol=1e-5)
+    assert torch.allclose(threat[0, 0], torch.tensor(-config.threat_coef), atol=1e-4)
     assert torch.allclose(threat[0, 1], torch.tensor(0.0), atol=1e-5)
 
     # just outside the radius: identically zero, not a small leftover
-    agent_pos[0, 0] = world_state.predator_pos[0] + torch.tensor([config.predator_danger_radius + 0.01, 0.0])
+    agent_pos = agent_pos.clone()
+    agent_pos[0, 0] = pred[0] + torch.tensor([config.predator_danger_radius + 0.01, 0.0])
     world_state = dataclasses.replace(world_state, agent_pos=agent_pos)
     threat = scenario.reward_terms(world_state, scenario_state, 0.0, config)["threat"]
     assert torch.allclose(threat, torch.zeros_like(threat), atol=1e-6)
@@ -614,35 +624,57 @@ def test_approach_anneal_fraction_zero_keeps_the_coefficient():
     assert torch.allclose(early, late, atol=1e-6)
 
 
-def test_threat_is_silent_while_the_predator_is_on_cooldown():
-    """A cooling predator cannot deal damage. Billing threat through that
-    window taught agents to freeze next to a harmless hunter. The term has
-    to be identically zero whenever cooldown > 0, even at zero distance.
+def test_threat_pays_only_while_the_predator_is_closing():
+    """A parked hunter on the crate is the case that emptied variant B of
+    pushers. Closing-rate gating has to be identically zero there, even at
+    zero distance; maximal while the predator closes at its speed cap;
+    reduced when the agent flees; and still zero beyond the radius.
     """
     config = dataclasses.replace(
         make_test_config(num_envs=1, n_agents=1),
         progress_coef=0.0, time_penalty_coef=0.0, success_reward=0.0,
         approach_coef_start=0.0, health_loss_coef=0.0, captured_reward=0.0,
         collision_coef=0.0, threat_coef=0.10, predator_danger_radius=1.0,
-        push_coef=0.0,
+        predator_max_speed=3.5, push_coef=0.0,
     )
     generator = torch.Generator().manual_seed(0)
     world_state, scenario_state = scenario.reset(1, config, generator)
+    pred = torch.tensor([[0.0, 0.0]])
+    agent_pos = torch.tensor([[[1e-4, 0.0]]])
+    zeros = torch.zeros(1, 1, 2)
     world_state = dataclasses.replace(
         world_state,
-        agent_pos=world_state.predator_pos.unsqueeze(1).clone(),
-        payload_pos=world_state.predator_pos + 50.0,
+        predator_pos=pred,
+        agent_pos=agent_pos,
+        predator_vel=torch.zeros(1, 2),
+        agent_vel=zeros,
+        payload_pos=pred + 50.0,
     )
+    parked = scenario.reward_terms(world_state, scenario_state, 0.0, config)["threat"]
+    assert torch.allclose(parked, torch.zeros_like(parked), atol=1e-6)
 
-    cooling = dataclasses.replace(
-        scenario_state, predator_cooldown=torch.tensor([10.0]))
-    threat = scenario.reward_terms(world_state, cooling, 0.0, config)["threat"]
-    assert torch.allclose(threat, torch.zeros_like(threat), atol=1e-6)
+    closing = dataclasses.replace(
+        world_state,
+        predator_vel=torch.tensor([[config.predator_max_speed, 0.0]]),
+    )
+    full = scenario.reward_terms(closing, scenario_state, 0.0, config)["threat"]
+    assert torch.allclose(full, torch.tensor([[-config.threat_coef]]), atol=1e-4)
 
-    live = dataclasses.replace(
-        scenario_state, predator_cooldown=torch.zeros(1))
-    threat = scenario.reward_terms(world_state, live, 0.0, config)["threat"]
-    assert torch.allclose(threat, torch.tensor([[-config.threat_coef]]), atol=1e-5)
+    fleeing = dataclasses.replace(
+        closing,
+        agent_vel=torch.tensor([[[config.predator_max_speed * 0.5, 0.0]]]),
+    )
+    reduced = scenario.reward_terms(fleeing, scenario_state, 0.0, config)["threat"]
+    assert reduced[0, 0] > full[0, 0]
+    assert reduced[0, 0] < 0.0
+
+    outside = dataclasses.replace(
+        closing,
+        agent_pos=torch.tensor([[[config.predator_danger_radius + 0.01, 0.0]]]),
+    )
+    assert torch.allclose(
+        scenario.reward_terms(outside, scenario_state, 0.0, config)["threat"],
+        torch.zeros(1, 1), atol=1e-6)
 
 
 # ---------------------------------------------------------------- obstacle spawn invariants
@@ -903,3 +935,26 @@ def test_payload_side_masks_split_behind_from_front():
     behind, front = scenario.payload_side_masks(world_state, scenario_state, 0.5)
     assert bool(behind[0, 0]) and not bool(front[0, 0])
     assert bool(front[0, 1]) and not bool(behind[0, 1])
+
+
+def test_predator_evade_masks_sign_follows_the_action():
+    """evade_cosine's sign is whether the action points away from the predator.
+    An agent thrusting away has to be positive; one thrusting toward it,
+    negative; one outside the radius is excluded by the mask.
+    """
+    config = make_test_config(num_envs=1, n_agents=2)
+    generator = torch.Generator().manual_seed(0)
+    world_state, _ = scenario.reset(1, config, generator)
+    world_state = dataclasses.replace(
+        world_state,
+        predator_pos=torch.tensor([[0.0, 0.0]]),
+        agent_pos=torch.tensor([[[1.0, 0.0], [5.0, 0.0]]]),
+    )
+    away = torch.tensor([[[1.0, 0.0], [1.0, 0.0]]])
+    cosine, in_radius = scenario.predator_evade_masks(world_state, away, 2.5)
+    assert bool(in_radius[0, 0]) and not bool(in_radius[0, 1])
+    assert cosine[0, 0] > 0.99
+
+    toward = torch.tensor([[[-1.0, 0.0], [1.0, 0.0]]])
+    cosine, _ = scenario.predator_evade_masks(world_state, toward, 2.5)
+    assert cosine[0, 0] < -0.99
