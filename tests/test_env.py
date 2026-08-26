@@ -192,6 +192,53 @@ def test_observe_does_not_include_predator_cooldown():
     assert torch.allclose(obs, obs_cooled, atol=1e-6)
 
 
+# ---------------------------------------------------------------- observation-only scripted policy
+
+def test_scripted_policy_returns_unit_actions_from_obs():
+    """Same contract as Actor.forward: local obs in, (E, N, 2) actions out."""
+    from tools.scripted_policy import scripted_policy
+
+    config = make_test_config(num_envs=2, n_agents=3)
+    world_state, scenario_state = scenario.reset(
+        config.num_envs, config, torch.Generator().manual_seed(0))
+    obs = scenario.observe(world_state, scenario_state, config)
+    actions = scripted_policy(obs, config)
+
+    assert actions.shape == (config.num_envs, config.n_agents, 2)
+    assert_finite(actions, "scripted actions")
+    assert (actions.abs() <= 1.0 + 1e-5).all()
+    norms = actions.norm(dim=-1)
+    assert torch.allclose(norms, torch.ones_like(norms), atol=1e-5)
+
+
+def test_scripted_policy_ignores_privileged_hunt_and_obstacles():
+    """predator_target and obstacle_center are not in the observation, so
+    flipping them after observe() cannot change the action. That is the
+    whole point of feeding the scripted controller the same tensor as the
+    actor: a comparison is not the controller reading a hunt timer the
+    deployed policy never sees."""
+    from tools.scripted_policy import scripted_policy
+
+    config = make_test_config(num_envs=2, n_agents=3)
+    world_state, scenario_state = scenario.reset(
+        config.num_envs, config, torch.Generator().manual_seed(0))
+    obs = scenario.observe(world_state, scenario_state, config)
+    actions = scripted_policy(obs, config)
+
+    flipped_target = (scenario_state.predator_target + 1) % config.n_agents
+    mutated_scenario = dataclasses.replace(
+        scenario_state, predator_target=flipped_target)
+    mutated_world = dataclasses.replace(
+        world_state, obstacle_center=world_state.obstacle_center + 10.0)
+
+    obs_mut = scenario.observe(mutated_world, mutated_scenario, config)
+    actions_mut = scripted_policy(obs_mut, config)
+
+    assert torch.allclose(obs, obs_mut, atol=1e-6), \
+        "observe() leaked predator_target or obstacle_center"
+    assert torch.allclose(actions, actions_mut, atol=1e-6)
+
+
 # ---------------------------------------------------------------- reset_at correctness
 
 def test_reset_at_leaves_unflagged_environments_untouched():

@@ -48,7 +48,7 @@ def load_actor(path, config):
 
 def scripted_policy_factory():
     from tools.scripted_policy import scripted_policy
-    return lambda ws, ss, cfg: scripted_policy(ws, ss, cfg)
+    return lambda ws, ss, cfg: scripted_policy(scenario.observe(ws, ss, cfg), cfg)
 
 
 def probe(config, policy, seeds=(0, 1, 2), n_steps=None):

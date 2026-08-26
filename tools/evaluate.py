@@ -269,12 +269,19 @@ if __name__ == "__main__":
     from train.config import Config
     from train.checkpoints import load_checkpoint
     from train.mappo import Actor, Critic
+    from tools.scripted_policy import scripted_policy
 
     CHECKPOINT_DIR = "train/checkpoints/variant_c_400"
     SEEDS = (0, 1, 2, 3, 4, 5, 6)
 
     config = Config(num_envs=16)
     print(HEADER)
+
+    def scripted_wrapper(world_state, scenario_state, cfg):
+        return scripted_policy(scenario.observe(world_state, scenario_state, cfg), cfg)
+
+    print(format_report(evaluate(config, scripted_wrapper), "scripted"))
+
     for seed in SEEDS:
         path = f"{CHECKPOINT_DIR}/seed_{seed}/checkpoint_best.pt"
         actor = Actor(config.obs_dim, 2, config.hidden_dim)
