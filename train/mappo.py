@@ -401,6 +401,10 @@ class TrainingLogger:
                 f"pos {record['position_ratio']:>5.2f}  "
                 f"peff {record['push_efficiency']:>5.1%}  "
                 f"eva {record['evade_cosine']:>5.2f}  "
+                f"hEva {record['hunted_evade_cosine']:>5.2f}  "
+                f"hThr {record['hunted_thrust']:>4.2f}  "
+                f"capO {record['capture_occupancy']:>5.1%}  "
+                f"camp {record['camping_time']:>5.1%}  "
                 f"thr {record['mean_threat_agents']:>4.2f}  "
                 f"pi {record['policy_loss']:>7.4f}  "
                 f"v {record['value_loss']:>9.3f}  "
@@ -481,7 +485,11 @@ class MAPPOTrainer:
         agent_payload_dist_sum = 0.0
         behind_count = front_count = 0
         force_goal_sum = force_mag_sum = 0.0
-        evade_cosine_sum = evade_count = 0.0
+        evade_acc = {k: 0.0 for k in (
+            "evade_cosine_sum", "evade_count", "hunted_cosine_sum", "hunted_thrust_sum",
+            "hunted_count", "other_cosine_sum", "other_thrust_sum", "other_count",
+            "closing_thrust_sum", "closing_count", "capture_hits", "agent_steps",
+            "camping_hits", "env_steps")}
         threat_agents_sum = 0.0
         n_beh_steps = 0
 
@@ -501,6 +509,7 @@ class MAPPOTrainer:
             # evade_cosine has to be scored on the board the action was chosen
             # against. info["world_state"] is post-step.
             pre_ws = self.env.world_state
+            pre_ss = self.env.scenario_state
             next_obs, reward, terminated, truncated, info = self.env.step(clipped, training_progress)
 
             # terminated/truncated are per-environment; the buffer is per-agent
@@ -556,10 +565,10 @@ class MAPPOTrainer:
                 ws, info["scenario_state"], self.config)
             force_goal_sum += goalward.sum().item()
             force_mag_sum += magnitude.sum().item()
-            evade_cos, in_danger = scenario.predator_evade_masks(
-                pre_ws, clipped, self.config.predator_danger_radius)
-            evade_cosine_sum += evade_cos[in_danger].sum().item()
-            evade_count += int(in_danger.sum())
+            evade_stats = scenario.evasion_step_stats(
+                pre_ws, pre_ss, clipped, self.config)
+            for key, value in evade_stats.items():
+                evade_acc[key] += value
             threat_agents_sum += (terms["threat"] != 0).float().sum(-1).mean().item()
             if self.config.push_coef:
                 push_penetration = terms["push"] / self.config.push_coef
@@ -621,7 +630,22 @@ class MAPPOTrainer:
             "mean_agent_payload_dist": agent_payload_dist_sum / n_beh_steps,
             "position_ratio": behind_count / max(front_count, 1),
             "push_efficiency": force_goal_sum / force_mag_sum if force_mag_sum else 0.0,
-            "evade_cosine": evade_cosine_sum / evade_count if evade_count else 0.0,
+            "evade_cosine": (evade_acc["evade_cosine_sum"] / evade_acc["evade_count"]
+                             if evade_acc["evade_count"] else 0.0),
+            "hunted_evade_cosine": (evade_acc["hunted_cosine_sum"] / evade_acc["hunted_count"]
+                                    if evade_acc["hunted_count"] else 0.0),
+            "hunted_thrust": (evade_acc["hunted_thrust_sum"] / evade_acc["hunted_count"]
+                              if evade_acc["hunted_count"] else 0.0),
+            "other_evade_cosine": (evade_acc["other_cosine_sum"] / evade_acc["other_count"]
+                                   if evade_acc["other_count"] else 0.0),
+            "other_thrust": (evade_acc["other_thrust_sum"] / evade_acc["other_count"]
+                             if evade_acc["other_count"] else 0.0),
+            "closing_thrust": (evade_acc["closing_thrust_sum"] / evade_acc["closing_count"]
+                               if evade_acc["closing_count"] else 0.0),
+            "capture_occupancy": (evade_acc["capture_hits"] / evade_acc["agent_steps"]
+                                  if evade_acc["agent_steps"] else 0.0),
+            "camping_time": (evade_acc["camping_hits"] / evade_acc["env_steps"]
+                             if evade_acc["env_steps"] else 0.0),
             "mean_threat_agents": threat_agents_sum / n_beh_steps,
         }
         if self.episode_term_returns is not None:

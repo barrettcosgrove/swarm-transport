@@ -240,21 +240,43 @@ class Config:
     # payload the predator guards; that objection is why this is exactly zero
     # beyond the radius rather than a global gradient.
     #
-    # 2.5 rather than 1.0 because fleeing a 3.5-speed predator costs 1.209
-    # units of net closure while an agent spins up against drag, so any
-    # reaction radius below capture 0.40 + 1.209 = 1.609 is caught even with
-    # perfect play at full thrust. tests/test_reward_invariants.py asserts
-    # the floor. 2.5 clears it and stays under the scripted controller's 3.0.
+    # 2.5 is variant C, the best win/capture basin (58-64% win, 14-21%
+    # capture). Variant D raised this to 3.0 and got a seed lottery
+    # (37/61/67% win); do not raise it again. The full-thrust spin-up
+    # floor is 1.609 (tests/test_reward_invariants.py).
     predator_danger_radius: float = 2.5
     # Peak per-step cost at zero distance, full closing speed, falling as
     # intrusion^2 * closing. Sized against the time penalty (the other
     # accumulating cost), not against progress RMS -- that comparison is
     # how variant B's 2.0 read as "6.5% of the progress signal" and then
     # summed to -138 an episode. tools/threat_calibrate.py on variant A
-    # geometry puts 1.0 at -14.5 / episode, 29% of reward_time, with 1.82
-    # agents paying per step. tests/test_reward_invariants.py asserts the
-    # pessimistic integral stays under a win.
+    # geometry puts 1.0 at -16.8 / episode at radius 3.0, 33% of reward_time.
+    # tests/test_reward_invariants.py asserts the pessimistic integral stays
+    # under a win.
     threat_coef: float = 1.0
+    # Always-on inside this radius, unlike threat which is closing-gated.
+    # 0.8 is 2x capture_radius 0.4: only the agent about to be hit, not the
+    # rest of the push zone. Wider than this is variant B (everyone leaves
+    # the crate). tests/test_reward_invariants.py asserts it stays inside
+    # the danger ring and at most 2x capture.
+    predator_camp_radius: float = 0.8
+    # Peak per-step cost at zero distance, falling as intrusion^2. Sized by
+    # tools/threat_calibrate.py against variant D geometry: 0.35 is -14.6
+    # / episode (35% of reward_time) with 2.04 agents paying per step.
+    # 1.0 matched the clock one-for-one and would have been variant B
+    # inside a tighter radius.
+    #
+    # Off. Variant E showed this pair cannot both spare the pushers and
+    # evict a hunter sitting on the crate: at 0.8 every pusher pays when
+    # the predator camps, and -18/episode loses to +300 progress. A
+    # larger field is variant B; a larger coef is the same tax on pushing.
+    # The term stays in reward_terms so the log key does not vanish.
+    camp_coef: float = 0.0
+    # Off. Variant G paid the hunted agent for cos(away)*|action| while
+    # closing. Episode flee was +1-2 against progress +250, and eval
+    # hunted cosine got worse than C (+0.09 vs +0.20). Leave the term
+    # in reward_terms so the log key does not vanish.
+    flee_coef: float = 0.0
     # 15 events at 40 steps each = 600 steps of life, against ~340 for a
     # traversal. At 100 the budget was 260 and arrival was impossible.
     max_health: float = 150.0
@@ -331,7 +353,9 @@ class Config:
 
         own pos/vel (4), goal offset (2), payload offset/rel vel (4),
         predator offset/rel vel (4), time remaining (1), shared health (1),
-        plus offset + rel vel for each teammate (4 each).
+        plus offset + rel vel for each teammate (4 each). Cooldown is
+        not observed: variant F added it (obs_dim 32 -> 33) and lost C's
+        basin. Agents already see predator pos/vel.
         """
         return 16 + 4 * (self.n_agents - 1)
 

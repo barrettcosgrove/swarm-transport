@@ -199,11 +199,16 @@ def test_threat_zone_leaves_room_to_push():
 
 
 # Fraction of agent-steps with nonzero closing-rate threat, measured by
-# tools/threat_calibrate.py against variant A at the eval horizon. Re-measure
+# tools/threat_calibrate.py against variant D at radius 3.0. Re-measure
 # whenever danger_radius or predator_max_speed change. This is a pessimistic
 # envelope -- most live steps pay a fraction of threat_coef -- so the
 # integral is an upper bound, not the realized episode sum.
-MEASURED_THREAT_DUTY = 0.3644
+MEASURED_THREAT_DUTY = 0.3855
+
+# Fraction of agent-steps with nonzero camping term, measured by
+# tools/threat_calibrate.py against variant D at camp_radius 0.8. Re-measure
+# whenever predator_camp_radius changes.
+MEASURED_CAMP_DUTY = 0.4089
 
 
 def test_threat_integral_stays_well_under_winning():
@@ -219,4 +224,62 @@ def test_threat_integral_stays_well_under_winning():
     assert budget < config.success_reward, (
         f"threat integral {budget:.1f} against success {config.success_reward}. "
         f"Lower threat_coef or re-measure MEASURED_THREAT_DUTY"
+    )
+
+
+def test_camp_radius_is_tighter_than_the_danger_ring():
+    """The camping term is the capture-bubble tax, not a second danger field.
+    It has to exceed capture_radius (otherwise it is a synonym for the hit
+    it is meant to pre-empt) and stay inside 2x that and well inside the
+    closing-gated ring. Wider is variant B: everyone leaves the crate.
+    """
+    config = Config()
+    assert config.predator_camp_radius > config.predator_capture_radius, (
+        "camp_radius must be a warning, not a synonym for capture"
+    )
+    assert config.predator_camp_radius <= 2.0 * config.predator_capture_radius, (
+        f"predator_camp_radius {config.predator_camp_radius} is wider than "
+        f"2x capture {config.predator_capture_radius}; that taxes the push zone"
+    )
+    assert config.predator_camp_radius < config.predator_danger_radius, (
+        f"predator_camp_radius {config.predator_camp_radius} must stay inside "
+        f"the danger ring {config.predator_danger_radius}"
+    )
+
+
+def test_camp_integral_stays_well_under_winning():
+    """Same envelope as threat. A 3.0 ungated field at threat_coef 1.0 is
+    how variant B summed to -138. Camping is always-on, so the duty is the
+    whole story -- it cannot hide behind a closing gate.
+    """
+    config = Config()
+    budget = config.max_steps * config.camp_coef * MEASURED_CAMP_DUTY
+    assert budget < config.success_reward, (
+        f"camp integral {budget:.1f} against success {config.success_reward}. "
+        f"Lower camp_coef or re-measure MEASURED_CAMP_DUTY"
+    )
+
+
+def test_flee_coef_is_off():
+    """Variant G's action bonus lost to C (hunted cosine +0.20 -> +0.09).
+    Do not turn it back on in the same run as the approach-while-camping
+    gate.
+    """
+    assert Config().flee_coef == 0.0
+
+
+def test_flee_integral_stays_well_under_winning():
+    """Only the hunted agent is paid, peak flee_coef per step. If that
+    envelope reached a win, fleeing forever would beat delivering the
+    crate -- variant B with the sign flipped.
+    """
+    config = Config()
+    budget = config.max_steps * config.flee_coef / config.n_agents
+    assert budget < config.success_reward, (
+        f"flee envelope {budget:.1f} against success {config.success_reward}. "
+        f"Lower flee_coef"
+    )
+    push_standoff = float(config.payload_halfsize.max()) + config.agent_radius
+    assert config.flee_coef < config.progress_coef * push_standoff, (
+        "flee term outweighs what pushing the payload can pay"
     )

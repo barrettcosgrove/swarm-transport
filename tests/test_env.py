@@ -171,6 +171,27 @@ def test_observe_goal_offset_matches_manual_calc():
     assert torch.allclose(goal_offset_from_obs, expected, atol=1e-5)
 
 
+def test_observe_does_not_include_predator_cooldown():
+    """Variant F put cooldown in the last slot (obs_dim 32 -> 33) and
+    lost C's basin. Last slot is shared health; toggling cooldown must
+    not change the observation.
+    """
+    config = make_test_config(num_envs=1, n_agents=2)
+    generator = torch.Generator().manual_seed(0)
+    world_state, scenario_state = scenario.reset(1, config, generator)
+    obs = scenario.observe(world_state, scenario_state, config)
+    assert obs.shape[-1] == config.obs_dim
+    health = scenario_state.health / config.max_health
+    assert torch.allclose(obs[..., -1], health.unsqueeze(-1).expand(1, 2), atol=1e-6)
+
+    cooled = dataclasses.replace(
+        scenario_state,
+        predator_cooldown=torch.full((1,), config.predator_cooldown_duration),
+    )
+    obs_cooled = scenario.observe(world_state, cooled, config)
+    assert torch.allclose(obs, obs_cooled, atol=1e-6)
+
+
 # ---------------------------------------------------------------- reset_at correctness
 
 def test_reset_at_leaves_unflagged_environments_untouched():
@@ -262,7 +283,7 @@ def test_shaping_terms_pay_for_improvement_not_position():
         make_test_config(num_envs=1, n_agents=1),
         progress_coef=0.0, time_penalty_coef=0.0, success_reward=0.0,
         health_loss_coef=0.0, captured_reward=0.0, collision_coef=0.0,
-        threat_coef=0.0, push_coef=0.0,
+        threat_coef=0.0, push_coef=0.0, camp_coef=0.0,
     )
     generator = torch.Generator().manual_seed(0)
     world_state, scenario_state = scenario.reset(1, config, generator)
@@ -295,7 +316,7 @@ def test_health_loss_blame_falls_on_the_agent_in_range():
         progress_coef=0.0, time_penalty_coef=0.0, success_reward=0.0,
         approach_coef_start=0.0, alignment_coef_start=0.0,
         captured_reward=0.0, collision_coef=0.0, threat_coef=0.0,
-        push_coef=0.0,
+        push_coef=0.0, camp_coef=0.0,
         health_loss_coef=1.0, health_loss_blame_fraction=0.7,
         health_loss_per_step=10.0,
     )
@@ -347,7 +368,7 @@ def test_progress_blame_falls_on_agents_in_the_push_zone():
         progress_coef=50.0, time_penalty_coef=0.0, success_reward=0.0,
         approach_coef_start=0.0, alignment_coef_start=0.0,
         captured_reward=0.0, collision_coef=0.0, threat_coef=0.0,
-        push_coef=0.0, health_loss_coef=0.0,
+        push_coef=0.0, health_loss_coef=0.0, camp_coef=0.0,
         progress_blame_fraction=0.7, push_zone_radius=0.5,
     )
     generator = torch.Generator().manual_seed(0)
@@ -404,7 +425,7 @@ def test_threat_term_is_zero_outside_the_danger_radius_and_private():
         approach_coef_start=0.0, alignment_coef_start=0.0,
         health_loss_coef=0.0, captured_reward=0.0, collision_coef=0.0,
         threat_coef=0.3, predator_danger_radius=1.0, push_coef=0.0,
-        predator_max_speed=3.5,
+        predator_max_speed=3.5, camp_coef=0.0,
     )
     generator = torch.Generator().manual_seed(0)
     world_state, scenario_state = scenario.reset(1, config, generator)
@@ -486,6 +507,45 @@ def test_approach_reward_pays_for_closing_on_the_standoff_point():
     approach_away = scenario.reward_terms(away, scenario_state, 0.0, config)["approach"]
     assert (approach_away < 0).all()
     assert torch.allclose(approach_toward, -approach_away, atol=1e-5)
+
+
+def test_approach_still_pays_while_the_predator_camps_the_payload():
+    """Variant H zeroed approach when the hunter sat on the crate and
+    push collapsed. C keeps the term on: same closing-the-standoff
+    payment whether the predator is parked or far away.
+    """
+    config = dataclasses.replace(
+        make_test_config(num_envs=1, n_agents=1),
+        progress_coef=0.0, time_penalty_coef=0.0, success_reward=0.0,
+        approach_coef_start=8.0, health_loss_coef=0.0, captured_reward=0.0,
+        collision_coef=0.0, threat_coef=0.0, push_coef=0.0, camp_coef=0.0,
+        flee_coef=0.0, approach_target_standoff=1.0,
+    )
+    generator = torch.Generator().manual_seed(0)
+    world_state, scenario_state = scenario.reset(1, config, generator)
+
+    payload = torch.tensor([[0.0, 0.0]])
+    goal = torch.tensor([[5.0, 0.0]])
+    start = torch.tensor([[[-2.0, 0.0]]])
+    closer = torch.tensor([[[-1.5, 0.0]]])
+    world_state = dataclasses.replace(
+        world_state, payload_pos=payload, agent_pos=closer,
+        obstacle_center=torch.full_like(world_state.obstacle_center, 1e6),
+    )
+    scenario_state = dataclasses.replace(
+        scenario_state, goal_pos=goal,
+        prev_agent_pushpoint_dist=scenario.agent_pushpoint_geometry(
+            start, payload, goal, config.approach_target_standoff),
+    )
+
+    away = dataclasses.replace(
+        world_state, predator_pos=torch.tensor([[50.0, 50.0]]))
+    parked = dataclasses.replace(
+        world_state, predator_pos=payload.clone())
+    live = scenario.reward_terms(away, scenario_state, 0.0, config)["approach"]
+    frozen = scenario.reward_terms(parked, scenario_state, 0.0, config)["approach"]
+    assert (live > 0).all()
+    assert torch.allclose(live, frozen, atol=1e-6)
 
 
 def test_push_reward_pays_for_goalward_contact_force():
@@ -635,7 +695,7 @@ def test_threat_pays_only_while_the_predator_is_closing():
         progress_coef=0.0, time_penalty_coef=0.0, success_reward=0.0,
         approach_coef_start=0.0, health_loss_coef=0.0, captured_reward=0.0,
         collision_coef=0.0, threat_coef=0.10, predator_danger_radius=1.0,
-        predator_max_speed=3.5, push_coef=0.0,
+        predator_max_speed=3.5, push_coef=0.0, camp_coef=0.0,
     )
     generator = torch.Generator().manual_seed(0)
     world_state, scenario_state = scenario.reset(1, config, generator)
@@ -958,3 +1018,115 @@ def test_predator_evade_masks_sign_follows_the_action():
     toward = torch.tensor([[[-1.0, 0.0], [1.0, 0.0]]])
     cosine, _ = scenario.predator_evade_masks(world_state, toward, 2.5)
     assert cosine[0, 0] < -0.99
+
+
+def test_camp_term_is_always_on_inside_its_radius_and_private():
+    """A parked hunter has to cost the agent in the capture bubble even
+    though closing-gated threat is zero there. Agent 1 well outside must
+    be untouched -- otherwise this is variant B's standing repulsion.
+    """
+    config = dataclasses.replace(
+        make_test_config(num_envs=1, n_agents=2),
+        progress_coef=0.0, time_penalty_coef=0.0, success_reward=0.0,
+        approach_coef_start=0.0, alignment_coef_start=0.0,
+        health_loss_coef=0.0, captured_reward=0.0, collision_coef=0.0,
+        threat_coef=0.0, push_coef=0.0,
+        camp_coef=0.4, predator_camp_radius=0.8,
+    )
+    generator = torch.Generator().manual_seed(0)
+    world_state, scenario_state = scenario.reset(1, config, generator)
+
+    pred = torch.tensor([[0.0, 0.0]])
+    agent_pos = torch.tensor([[[1e-4, 0.0], [5.0, 0.0]]])
+    world_state = dataclasses.replace(
+        world_state,
+        predator_pos=pred,
+        agent_pos=agent_pos,
+        predator_vel=torch.zeros(1, 2),
+        agent_vel=torch.zeros_like(agent_pos),
+    )
+    camp = scenario.reward_terms(world_state, scenario_state, 0.0, config)["camp"]
+    assert torch.allclose(camp[0, 0], torch.tensor(-config.camp_coef), atol=1e-4)
+    assert torch.allclose(camp[0, 1], torch.tensor(0.0), atol=1e-5)
+    threat = scenario.reward_terms(world_state, scenario_state, 0.0, config)["threat"]
+    assert torch.allclose(threat, torch.zeros_like(threat), atol=1e-6)
+
+    agent_pos = agent_pos.clone()
+    agent_pos[0, 0] = pred[0] + torch.tensor([config.predator_camp_radius + 0.01, 0.0])
+    world_state = dataclasses.replace(world_state, agent_pos=agent_pos)
+    camp = scenario.reward_terms(world_state, scenario_state, 0.0, config)["camp"]
+    assert torch.allclose(camp, torch.zeros_like(camp), atol=1e-6)
+
+
+def test_flee_term_pays_only_the_hunted_agent_for_the_scripted_action():
+    """Position taxes hit every pusher when the hunter sits on the crate.
+    This term has to stay off for the other agent, off when the hunter is
+    parked, and signed with the action: away pays, toward costs, standing
+    is zero. Otherwise it is variant B with extra steps.
+    """
+    config = dataclasses.replace(
+        make_test_config(num_envs=1, n_agents=2),
+        flee_coef=2.0, predator_danger_radius=2.5, predator_max_speed=3.5,
+        camp_coef=0.0, threat_coef=0.0,
+    )
+    generator = torch.Generator().manual_seed(0)
+    world_state, scenario_state = scenario.reset(1, config, generator)
+    world_state = dataclasses.replace(
+        world_state,
+        predator_pos=torch.tensor([[0.0, 0.0]]),
+        predator_vel=torch.tensor([[3.5, 0.0]]),
+        agent_pos=torch.tensor([[[1.0, 0.0], [1.0, 1.0]]]),
+        agent_vel=torch.zeros(1, 2, 2),
+    )
+    scenario_state = dataclasses.replace(
+        scenario_state, predator_target=torch.tensor([0]))
+
+    away = torch.tensor([[[1.0, 0.0], [1.0, 0.0]]])
+    flee = scenario.hunted_flee_term(world_state, scenario_state, away, config)
+    assert torch.allclose(flee[0, 0], torch.tensor(config.flee_coef), atol=1e-4)
+    assert torch.allclose(flee[0, 1], torch.tensor(0.0), atol=1e-5)
+
+    toward = torch.tensor([[[-1.0, 0.0], [1.0, 0.0]]])
+    flee = scenario.hunted_flee_term(world_state, scenario_state, toward, config)
+    assert torch.allclose(flee[0, 0], torch.tensor(-config.flee_coef), atol=1e-4)
+    assert torch.allclose(flee[0, 1], torch.tensor(0.0), atol=1e-5)
+
+    still = torch.zeros(1, 2, 2)
+    flee = scenario.hunted_flee_term(world_state, scenario_state, still, config)
+    assert torch.allclose(flee, torch.zeros_like(flee), atol=1e-6)
+
+    parked = dataclasses.replace(world_state, predator_vel=torch.zeros(1, 2))
+    flee = scenario.hunted_flee_term(parked, scenario_state, away, config)
+    assert torch.allclose(flee, torch.zeros_like(flee), atol=1e-6)
+
+    far = dataclasses.replace(
+        world_state,
+        agent_pos=torch.tensor([[[config.predator_danger_radius + 0.1, 0.0],
+                                 [1.0, 1.0]]]),
+    )
+    flee = scenario.hunted_flee_term(far, scenario_state, away, config)
+    assert torch.allclose(flee[0, 0], torch.tensor(0.0), atol=1e-6)
+
+
+def test_evasion_step_stats_split_hunted_from_other():
+    """Hunted-agent cosine is the metric that actually tracks capture rate.
+    Unsigned evade_cosine averages the hunted flee with everyone else pushing.
+    """
+    config = make_test_config(num_envs=1, n_agents=2)
+    generator = torch.Generator().manual_seed(0)
+    world_state, scenario_state = scenario.reset(1, config, generator)
+    world_state = dataclasses.replace(
+        world_state,
+        predator_pos=torch.tensor([[0.0, 0.0]]),
+        agent_pos=torch.tensor([[[1.0, 0.0], [1.0, 1.0]]]),
+    )
+    scenario_state = dataclasses.replace(
+        scenario_state, predator_target=torch.tensor([0]))
+    # hunted flees +x (away); the other steers toward the predator
+    actions = torch.tensor([[[1.0, 0.0], [-1.0, 0.0]]])
+    stats = scenario.evasion_step_stats(world_state, scenario_state, actions, config)
+    assert stats["hunted_count"] == 1
+    assert stats["other_count"] == 1
+    assert stats["hunted_cosine_sum"] > 0.99
+    assert stats["other_cosine_sum"] < 0.0
+    assert stats["env_steps"] == 1

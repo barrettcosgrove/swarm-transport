@@ -246,6 +246,13 @@ def payload_side_masks(world_state, scenario_state, zone_radius):
     return in_zone & (side < -0.4), in_zone & (side > 0.4)
 
 
+# Closing above this is the population where fleeing is the right answer.
+# Shared by evasion_step_stats and tools/threat_probe so the split cannot drift.
+PREDATOR_CLOSING_ON = 0.2
+# Predator sitting on the crate. Shared by evaluate and the trainer log.
+PREDATOR_CAMPING_PAYLOAD_DIST = 0.75
+
+
 def predator_evade_masks(world_state, actions, danger_radius):
     """cos(action, away from predator) and who is inside ``danger_radius``.
 
@@ -259,6 +266,84 @@ def predator_evade_masks(world_state, actions, danger_radius):
     away = -to_pred / dist.unsqueeze(-1).clamp(min=1e-6)
     cosine = (actions * away).sum(-1) / actions.norm(dim=-1).clamp(min=1e-6)
     return cosine, dist <= danger_radius
+
+
+def predator_hunted_mask(scenario_state, n_agents):
+    """Which agent the predator is committed to, as an (E, n_agents) bool."""
+    return torch.nn.functional.one_hot(
+        scenario_state.predator_target, num_classes=n_agents).bool()
+
+
+def predator_camping(world_state, payload_dist=PREDATOR_CAMPING_PAYLOAD_DIST):
+    """True on environments where the predator is sitting on the crate."""
+    return (world_state.predator_pos - world_state.payload_pos).norm(dim=-1) < payload_dist
+
+
+def _masked_sum_count(mask, values):
+    n = int(mask.sum())
+    return (float(values[mask].sum()) if n else 0.0), n
+
+
+def evasion_step_stats(world_state, scenario_state, actions, config):
+    """Per-step evasion sums and counts.
+
+    Shared by the trainer log and tools.evaluate so the two reports cannot
+    drift apart on the metrics that gate the camping term: unsigned
+    evade_cosine was blind to 19% vs 0% capture.
+    """
+    cosine, in_danger = predator_evade_masks(
+        world_state, actions, config.predator_danger_radius)
+    dist, _, closing = predator_closing(world_state, config)
+    hunted = predator_hunted_mask(scenario_state, config.n_agents)
+    a_norm = actions.norm(dim=-1)
+    hunted_d = hunted & in_danger
+    other_d = (~hunted) & in_danger
+    closing_on = closing > PREDATOR_CLOSING_ON
+    hunted_cos_sum, hunted_n = _masked_sum_count(hunted_d, cosine)
+    hunted_thr_sum, _ = _masked_sum_count(hunted_d, a_norm)
+    other_cos_sum, other_n = _masked_sum_count(other_d, cosine)
+    other_thr_sum, _ = _masked_sum_count(other_d, a_norm)
+    closing_thr_sum, closing_n = _masked_sum_count(closing_on, a_norm)
+    evade_sum, evade_n = _masked_sum_count(in_danger, cosine)
+    return {
+        "evade_cosine_sum": evade_sum,
+        "evade_count": evade_n,
+        "hunted_cosine_sum": hunted_cos_sum,
+        "hunted_thrust_sum": hunted_thr_sum,
+        "hunted_count": hunted_n,
+        "other_cosine_sum": other_cos_sum,
+        "other_thrust_sum": other_thr_sum,
+        "other_count": other_n,
+        "closing_thrust_sum": closing_thr_sum,
+        "closing_count": closing_n,
+        "capture_hits": int((dist < config.predator_capture_radius).sum()),
+        "agent_steps": int(dist.numel()),
+        "camping_hits": int(predator_camping(world_state).sum()),
+        "env_steps": int(world_state.payload_pos.shape[0]),
+    }
+
+
+def hunted_flee_term(world_state, scenario_state, actions, config):
+    """Private bonus for the scripted evade action.
+
+    ``flee_coef * hunted * in_danger * closing * cos(away) * |action|``.
+    Zero for everyone except the committed target, zero when the hunter
+    is parked (closing=0), zero outside danger_radius. Signed: thrusting
+    at the predator costs, thrusting away pays. ``|action|`` is clamped
+    at 1 so a diagonal cannot out-earn a unit-norm flee.
+    """
+    E, N = world_state.agent_pos.shape[:2]
+    zeros = torch.zeros(E, N, device=world_state.agent_pos.device,
+                        dtype=world_state.agent_pos.dtype)
+    if actions is None or config.flee_coef == 0.0:
+        return zeros
+    cosine, in_danger = predator_evade_masks(
+        world_state, actions, config.predator_danger_radius)
+    _, _, closing = predator_closing(world_state, config)
+    hunted = predator_hunted_mask(scenario_state, config.n_agents)
+    thrust = actions.norm(dim=-1).clamp(max=1.0)
+    gate = hunted.float() * in_danger.float() * closing
+    return config.flee_coef * gate * cosine * thrust
 
 
 def predator_closing(world_state, config):
@@ -303,7 +388,8 @@ def goalward_push_penetration(world_state, scenario_state, config) -> torch.Tens
     return ((-force_on_agent) * goal_dir.unsqueeze(1)).sum(-1) / config.payload_stiffness
 
 
-def reward_terms(world_state, scenario_state, training_progress, config) -> dict[str, torch.Tensor]:
+def reward_terms(world_state, scenario_state, training_progress, config,
+                 actions=None, action_world_state=None, action_scenario_state=None) -> dict[str, torch.Tensor]:
     """Every reward component separately, each (E, n_agents), keyed by name.
 
     compute_reward is the sum of these. Split apart because the totals hide the
@@ -383,6 +469,24 @@ def reward_terms(world_state, scenario_state, training_progress, config) -> dict
     dist_to_predator, intrusion, closing = predator_closing(world_state, config)
     threat_reward = -config.threat_coef * intrusion.pow(2) * closing
 
+    # PRIVATE, NOT GATED ON CLOSING: standing in the capture bubble while the
+    # hunter is parked. Closing-gated threat is identically zero there, which
+    # is the freeze variant D measured -- 32-47% of agents still in the push
+    # zone with the predator on the crate. Squared so value and derivative
+    # vanish at camp_radius. Tight by construction: beyond ~0.8 this becomes
+    # a standing reason to abandon the crate, which is variant B.
+    camp_intrusion = ((config.predator_camp_radius - dist_to_predator)
+                      .clamp(min=0.0) / config.predator_camp_radius)
+    camp_reward = -config.camp_coef * camp_intrusion.pow(2)
+
+    # PRIVATE: the scripted action, not a position tax. Scored on the
+    # board the action was chosen against (action_world_state), matching
+    # evasion_step_stats. Post-step geometry would credit a flee to a
+    # gap that has already moved.
+    flee_ws = action_world_state if action_world_state is not None else world_state
+    flee_ss = action_scenario_state if action_scenario_state is not None else scenario_state
+    flee_reward = hunted_flee_term(flee_ws, flee_ss, actions, config)
+
     # SHARED + PRIVATE: update_health drains a flat health_loss_per_step on
     # any() over agents, so the pool itself does not know who was hit. This
     # split is the only place per-agent responsibility can enter. The private
@@ -420,11 +524,13 @@ def reward_terms(world_state, scenario_state, training_progress, config) -> dict
         "captured": captured_reward,
         "collision": collision_reward,
         "threat": threat_reward,
+        "camp": camp_reward,
+        "flee": flee_reward,
     }
 
 
-def compute_reward(world_state, scenario_state, training_progress, config) -> torch.Tensor:   # (E, n_agents)
-    return torch.stack(tuple(reward_terms(world_state, scenario_state, training_progress, config).values())).sum(0)
+def compute_reward(world_state, scenario_state, training_progress, config, actions=None) -> torch.Tensor:   # (E, n_agents)
+    return torch.stack(tuple(reward_terms(world_state, scenario_state, training_progress, config, actions=actions).values())).sum(0)
 
 def compute_done(world_state, scenario_state, config) -> tuple[torch.Tensor, torch.Tensor]:
     E = world_state.agent_pos.shape[0]

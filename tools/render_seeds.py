@@ -1,7 +1,7 @@
 """
 tools/render_seeds.py
 
-Renders the best policy of each variant C seed as its own GIF.
+Renders the best policy of each variant C 400-iter seed as its own GIF.
 
 Usage:
     python -m tools.render_seeds
@@ -16,14 +16,14 @@ from train.mappo import Actor, Critic
 from tools.render import record_episode, render_to_gif
 
 
-SEEDS = (0, 1, 2)
-CHECKPOINT_DIR = "train/checkpoints/variant_c_closing_threat"
+SEEDS = (0, 1, 2, 3, 4, 5, 6)
+CHECKPOINT_DIR = "train/checkpoints/variant_c_400"
 
 
 def main():
     for seed in SEEDS:
         path = f"{CHECKPOINT_DIR}/seed_{seed}/checkpoint_best.pt"
-        out = f"outputs/actor_variant_c_closing_threat_seed_{seed}.gif"
+        out = f"outputs/actor_variant_c_400_seed_{seed}.gif"
 
         config = Config(num_envs=4, seed=seed)
         actor = Actor(config.obs_dim, 2, config.hidden_dim)

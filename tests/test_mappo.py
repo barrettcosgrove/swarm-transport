@@ -102,8 +102,10 @@ def test_one_iteration_produces_the_expected_shapes():
                 "mean_push_events", "mean_contact_cosine", "mean_push_abs",
                 "mean_push_signed", "mean_agent_payload_dist",
                 "position_ratio", "push_efficiency", "evade_cosine",
-                "mean_threat_agents",
-                "reward_progress", "reward_health", "reward_threat", "reward_push"):
+                "mean_threat_agents", "capture_occupancy", "camping_time",
+                "hunted_evade_cosine", "hunted_thrust", "closing_thrust",
+                "reward_progress", "reward_health", "reward_threat", "reward_push",
+                "reward_camp", "reward_flee"):
         assert key in outcomes, f"outcomes is missing {key}"
     assert 0.0 <= outcomes["mean_push_events"] <= config.n_agents
     assert -1.0 <= outcomes["mean_contact_cosine"] <= 1.0
@@ -438,6 +440,7 @@ def test_short_training_run_is_finite_and_writes_its_log():
                     "mean_contact_cosine", "mean_push_abs", "mean_push_signed",
                     "mean_agent_payload_dist", "position_ratio", "push_efficiency",
                     "evade_cosine", "mean_threat_agents",
+                    "capture_occupancy", "camping_time", "hunted_evade_cosine",
                     "advantage_private_fraction"):
             assert key in record, f"the log is missing {key}"
             assert math.isfinite(record[key]), f"{key} is not finite"
@@ -497,7 +500,8 @@ def test_periodic_eval_writes_checkpoint_best_and_outcome_rates():
     for key in ("eval_win_rate", "eval_capture_rate", "eval_timeout_rate",
                 "eval_position_ratio", "eval_push_efficiency",
                 "eval_mean_payload_progress", "eval_mean_end_health",
-                "eval_evade_cosine"):
+                "eval_evade_cosine", "eval_capture_occupancy",
+                "eval_camping_time", "eval_hunted_evade_cosine"):
         assert key in record, f"eval log is missing {key}"
         assert math.isfinite(record[key]) or key.endswith("steps"), f"{key} is not finite"
     rates = record["eval_win_rate"] + record["eval_capture_rate"] + record["eval_timeout_rate"]

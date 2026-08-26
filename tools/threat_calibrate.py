@@ -1,7 +1,8 @@
 """
 tools/threat_calibrate.py
 
-Sizes the closing-rate threat term against the time penalty.
+Sizes the closing-rate threat term and the always-on camping term against
+the time penalty.
 
 The previous sweep sized threat against progress RMS. Progress is a
 zero-mean telescoping term whose episode total is capped near 315;
@@ -10,16 +11,17 @@ penalty, not of progress. That mismatch is how variant B landed at
 -138 per episode (230% of reward_time) while looking like "6.5% of
 the progress signal."
 
-This sweep replays a variant A checkpoint (obs_dim is unchanged, so
-the weights still load) and recomputes the closing-rate form under
-candidate coefficients. Reported per candidate:
+Camping is the same shape of cost, restricted to ~0.8 of the predator
+and not gated on closing. Same target band: episode sum -12 to -18,
+about 20-30% of the time penalty. Do not reuse threat_coef at radius
+3.0 without a gate -- that is how variant B inverted the objective.
 
-  episode-summed threat, as a fraction of reward_time
-  duty cycle: fraction of agent-steps with nonzero threat
-  mean agents per step paying threat
+Replays a variant D checkpoint (obs_dim is unchanged). Reported per
+candidate coefficient:
 
-The target band is episode threat -12 to -18, about 20-30% of the
-time penalty. Variant A was -0.4; variant B was -138.
+  episode-summed cost, as a fraction of reward_time
+  duty cycle: fraction of agent-steps with a nonzero term
+  mean agents per step paying
 
 Usage:
     python -m tools.threat_calibrate
@@ -33,7 +35,8 @@ from env import scenario
 from train.config import Config
 from tools.freeze_probe import load_actor
 
-COEFS = (0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0)
+COEFS = (0.25, 0.35, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0)
+TARGET_LO, TARGET_HI = -18.0, -12.0
 
 
 def escape_feasibility(config):
@@ -68,7 +71,7 @@ def escape_feasibility(config):
               f"{'escapes' if closest > config.predator_capture_radius else 'caught':>10}")
 
 
-def sweep(config, policy, seeds=(0, 1), n_steps=None):
+def _sweep(config, policy, unit_from_info, label, duty_name, seeds=(0, 1), n_steps=None):
     n_steps = n_steps or config.max_steps
     unit_ep = 0.0
     time_ep = 0.0
@@ -76,8 +79,6 @@ def sweep(config, policy, seeds=(0, 1), n_steps=None):
     agents_paying = 0.0
     env_steps = 0
     episodes = 0
-    running_unit = None
-    running_time = None
 
     for seed in seeds:
         cfg = dataclasses.replace(config, seed=seed)
@@ -89,9 +90,7 @@ def sweep(config, policy, seeds=(0, 1), n_steps=None):
         for _ in range(n_steps):
             actions = policy(env.world_state, env.scenario_state, cfg)
             _, _, terminated, truncated, info = env.step(actions, training_progress=1.0)
-            ws = info["world_state"]
-            _, intrusion, closing = scenario.predator_closing(ws, cfg)
-            unit = -(intrusion.pow(2) * closing)
+            unit = unit_from_info(info, cfg)
             running_unit += unit.mean(-1)
             running_time += info["reward_terms"]["time"].mean(-1)
             live = unit != 0
@@ -111,21 +110,39 @@ def sweep(config, policy, seeds=(0, 1), n_steps=None):
     mean_agents = agents_paying / max(env_steps, 1)
     unit_mean = unit_ep / max(episodes, 1)
     time_mean = time_ep / max(episodes, 1)
-    print("\n=== closing-rate threat sweep (variant A geometry) ===")
+    print(f"\n=== {label} ===")
     print(f"  episodes {episodes}  duty {duty:.1%}  agents paying/step {mean_agents:.2f}")
-    print(f"  reward_time {time_mean:.1f}  unit-coef threat {unit_mean:.2f}")
-    print(f"{'coef':>7}{'ep threat':>12}{'% of time':>11}{'band':>10}")
+    print(f"  reward_time {time_mean:.1f}  unit-coef cost {unit_mean:.2f}")
+    print(f"{'coef':>7}{'ep cost':>12}{'% of time':>11}{'band':>10}")
     for coef in COEFS:
         ep = coef * unit_mean
         frac = ep / time_mean if time_mean else float("nan")
-        lo, hi = -18.0, -12.0
-        band = "target" if lo <= ep <= hi else ("low" if ep > hi else "high")
+        band = "target" if TARGET_LO <= ep <= TARGET_HI else ("low" if ep > TARGET_HI else "high")
         print(f"{coef:>7.2f}{ep:>12.1f}{frac:>11.0%}{band:>10}")
-    print(f"  MEASURED_THREAT_DUTY = {duty:.4f}")
+    print(f"  {duty_name} = {duty:.4f}")
+    return duty
+
+
+def threat_unit(info, cfg):
+    _, intrusion, closing = scenario.predator_closing(info["world_state"], cfg)
+    return -(intrusion.pow(2) * closing)
+
+
+def camp_unit(info, cfg):
+    # Divide out the configured coefficient so the sweep is in unit-coef
+    # space, same as threat_unit. reward_terms is the source of truth.
+    if cfg.camp_coef == 0.0:
+        return torch.zeros_like(info["reward_terms"]["time"])
+    return info["reward_terms"]["camp"] / cfg.camp_coef
 
 
 if __name__ == "__main__":
     config = Config(num_envs=16)
     escape_feasibility(config)
-    path = "train/checkpoints/variant_a_progress_blame/seed_1/checkpoint_best.pt"
-    sweep(config, load_actor(path, config))
+    path = "train/checkpoints/variant_d_danger_radius/seed_2/checkpoint_best.pt"
+    policy = load_actor(path, config)
+    n_steps = 2 * config.max_steps
+    _sweep(config, policy, threat_unit, "closing-rate threat sweep (variant D)",
+           "MEASURED_THREAT_DUTY", n_steps=n_steps)
+    _sweep(config, policy, camp_unit, "camping-term sweep (variant D, radius 0.8)",
+           "MEASURED_CAMP_DUTY", n_steps=n_steps)

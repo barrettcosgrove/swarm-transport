@@ -180,11 +180,14 @@ def physics_ceiling(config):
 
 
 if __name__ == "__main__":
+    CHECKPOINT_DIR = "train/checkpoints/variant_d_danger_radius"
+    SEEDS = (0, 1, 2)
+
     config = Config(num_envs=16)
     physics_ceiling(config)
-    for seed in (1, 2):
-        path = f"train/checkpoints/variant_a_progress_blame/seed_{seed}/checkpoint_best.pt"
+    for seed in SEEDS:
+        path = f"{CHECKPOINT_DIR}/seed_{seed}/checkpoint_best.pt"
         acc, speeds, over = probe(config, load_actor(path, config))
-        report(acc, speeds, over, f"variant_a seed_{seed}")
+        report(acc, speeds, over, f"variant_d seed_{seed}")
     acc, speeds, over = probe(config, scripted_policy_factory())
     report(acc, speeds, over, "scripted")

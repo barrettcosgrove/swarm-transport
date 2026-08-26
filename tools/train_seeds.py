@@ -3,11 +3,10 @@ tools/train_seeds.py
 
 Independent MAPPO runs across several seeds, written to one JSON.
 
-This is variant C: closing-rate gated threat (predator_danger_radius 2.5,
-threat_coef 1.0) on top of variant A's zone-attributed progress. Same
-250-iteration / 3-seed protocol. Do not point it at
-outputs/variant_a_progress_blame.json or outputs/variant_b_evasion.json
--- those logs are the matched baselines.
+C's recipe: obs_dim 32, closing-gated threat at radius 2.5, camp off,
+flee off, approach always on. 7 seeds x 400 iterations. Do not point
+it at outputs/variant_c_closing_threat.json -- that 3x250 log is the
+matched baseline.
 
 Usage:
     python -m tools.train_seeds
@@ -20,9 +19,9 @@ from train.config import Config
 from train.mappo import MAPPOTrainer
 
 
-SEEDS = (0, 1, 2)
-LOG_PATH = "outputs/variant_c_closing_threat.json"
-CHECKPOINT_DIR = "train/checkpoints/variant_c_closing_threat"
+SEEDS = (0, 1, 2, 3, 4, 5, 6)
+LOG_PATH = "outputs/variant_c_400.json"
+CHECKPOINT_DIR = "train/checkpoints/variant_c_400"
 
 
 def main():
@@ -38,7 +37,7 @@ def main():
         config = dataclasses.replace(
             Config(),
             seed=seed,
-            num_iterations=250,
+            num_iterations=400,
             log_path=LOG_PATH,
             checkpoint_dir=os.path.join(CHECKPOINT_DIR, f"seed_{seed}"),
         )

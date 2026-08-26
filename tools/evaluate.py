@@ -23,6 +23,7 @@ Usage:
     print(format_report(evaluate(config, policy)))
 
     python -m tools.evaluate
+    # prints deterministic mean and sampled (training-noise) rows per seed
 """
 import dataclasses
 from dataclasses import dataclass
@@ -54,6 +55,13 @@ class EvalResult:
     mean_min_predator_dist: float
     mean_team_spread: float
     evade_cosine: float
+    capture_occupancy: float
+    camping_time: float
+    hunted_evade_cosine: float
+    hunted_thrust: float
+    other_evade_cosine: float
+    other_thrust: float
+    closing_thrust: float
 
     @property
     def damage_tail_ratio(self) -> float:
@@ -85,11 +93,22 @@ class EvalResult:
             "eval_mean_min_predator_dist": self.mean_min_predator_dist,
             "eval_mean_team_spread": self.mean_team_spread,
             "eval_evade_cosine": self.evade_cosine,
+            "eval_capture_occupancy": self.capture_occupancy,
+            "eval_camping_time": self.camping_time,
+            "eval_hunted_evade_cosine": self.hunted_evade_cosine,
+            "eval_hunted_thrust": self.hunted_thrust,
+            "eval_other_evade_cosine": self.other_evade_cosine,
+            "eval_other_thrust": self.other_thrust,
+            "eval_closing_thrust": self.closing_thrust,
         }
 
 
 def _mean(values):
     return sum(values) / len(values) if values else float("nan")
+
+
+def _ratio(total, n):
+    return total / n if n else float("nan")
 
 
 def evaluate(config, policy, seeds=(0, 1, 2), n_steps=None):
@@ -115,7 +134,11 @@ def evaluate(config, policy, seeds=(0, 1, 2), n_steps=None):
     behind = front = 0
     force_goal = force_mag = 0.0
     pred_sum = spread_sum = 0.0
-    evade_cosine_sum = evade_count = 0.0
+    evade = {k: 0.0 for k in (
+        "evade_cosine_sum", "evade_count", "hunted_cosine_sum", "hunted_thrust_sum",
+        "hunted_count", "other_cosine_sum", "other_thrust_sum", "other_count",
+        "closing_thrust_sum", "closing_count", "capture_hits", "agent_steps",
+        "camping_hits", "env_steps")}
     n_beh = 0
 
     for seed in seeds:
@@ -130,10 +153,10 @@ def evaluate(config, policy, seeds=(0, 1, 2), n_steps=None):
             health_before = scenario_state.health.clone()
 
             actions = policy(world_state, scenario_state, cfg)
-            evade_cos, in_danger = scenario.predator_evade_masks(
-                world_state, actions, cfg.predator_danger_radius)
-            evade_cosine_sum += evade_cos[in_danger].sum().item()
-            evade_count += int(in_danger.sum())
+            stats = scenario.evasion_step_stats(
+                world_state, scenario_state, actions, cfg)
+            for key, value in stats.items():
+                evade[key] += value
             _, _, terminated, truncated, info = env.step(actions, training_progress=1.0)
 
             ws = info["world_state"]
@@ -200,13 +223,29 @@ def evaluate(config, policy, seeds=(0, 1, 2), n_steps=None):
         mean_payload_progress=_mean(payload_progress),
         mean_min_predator_dist=pred_sum / n_beh if n_beh else float("nan"),
         mean_team_spread=spread_sum / n_beh if n_beh else float("nan"),
-        evade_cosine=evade_cosine_sum / evade_count if evade_count else 0.0,
+        evade_cosine=_ratio(evade["evade_cosine_sum"], evade["evade_count"])
+            if evade["evade_count"] else 0.0,
+        capture_occupancy=_ratio(evade["capture_hits"], evade["agent_steps"])
+            if evade["agent_steps"] else 0.0,
+        camping_time=_ratio(evade["camping_hits"], evade["env_steps"])
+            if evade["env_steps"] else 0.0,
+        hunted_evade_cosine=_ratio(evade["hunted_cosine_sum"], evade["hunted_count"])
+            if evade["hunted_count"] else 0.0,
+        hunted_thrust=_ratio(evade["hunted_thrust_sum"], evade["hunted_count"])
+            if evade["hunted_count"] else 0.0,
+        other_evade_cosine=_ratio(evade["other_cosine_sum"], evade["other_count"])
+            if evade["other_count"] else 0.0,
+        other_thrust=_ratio(evade["other_thrust_sum"], evade["other_count"])
+            if evade["other_count"] else 0.0,
+        closing_thrust=_ratio(evade["closing_thrust_sum"], evade["closing_count"])
+            if evade["closing_count"] else 0.0,
     )
 
 
 HEADER = (f"{'variant':<28}{'win%':>6}{'cap%':>6}{'to%':>6}"
           f"{'win':>5}{'cap':>5}{'to':>5}{'len':>6}"
-          f"{'posR':>6}{'pshE':>6}{'prog':>7}{'pred':>6}{'eva':>6}{'hp':>6}")
+          f"{'posR':>6}{'pshE':>6}{'prog':>7}{'pred':>6}{'eva':>6}{'hp':>6}"
+          f"{'capO':>6}{'camp':>6}{'hEva':>6}{'hThr':>6}{'cThr':>6}")
 
 
 def format_report(result, label=""):
@@ -217,7 +256,12 @@ def format_report(result, label=""):
             f"{result.mean_payload_progress:>7.2f}"
             f"{result.mean_min_predator_dist:>6.2f}"
             f"{result.evade_cosine:>6.2f}"
-            f"{result.mean_end_health:>6.0f}")
+            f"{result.mean_end_health:>6.0f}"
+            f"{result.capture_occupancy:>5.0%}"
+            f"{result.camping_time:>5.0%}"
+            f"{result.hunted_evade_cosine:>6.2f}"
+            f"{result.hunted_thrust:>6.2f}"
+            f"{result.closing_thrust:>6.2f}")
 
 
 if __name__ == "__main__":
@@ -226,17 +270,20 @@ if __name__ == "__main__":
     from train.checkpoints import load_checkpoint
     from train.mappo import Actor, Critic
 
-    CHECKPOINT = "train/checkpoints/variant_c_closing_threat/seed_2/checkpoint_best.pt"
+    CHECKPOINT_DIR = "train/checkpoints/variant_c_400"
+    SEEDS = (0, 1, 2, 3, 4, 5, 6)
 
     config = Config(num_envs=16)
-    actor = Actor(config.obs_dim, 2, config.hidden_dim)
-    critic = Critic(config.obs_dim, config.n_agents, config.hidden_dim)
-    load_checkpoint(CHECKPOINT, actor, critic)
-    actor.eval()
-
-    def actor_policy(world_state, scenario_state, cfg):
-        with torch.no_grad():
-            return actor(scenario.observe(world_state, scenario_state, cfg)).clamp(-1.0, 1.0)
-
     print(HEADER)
-    print(format_report(evaluate(config, actor_policy), "variant_c_closing_threat/seed_2"))
+    for seed in SEEDS:
+        path = f"{CHECKPOINT_DIR}/seed_{seed}/checkpoint_best.pt"
+        actor = Actor(config.obs_dim, 2, config.hidden_dim)
+        critic = Critic(config.obs_dim, config.n_agents, config.hidden_dim)
+        load_checkpoint(path, actor, critic)
+        actor.eval()
+
+        def mean_policy(world_state, scenario_state, cfg, actor=actor):
+            with torch.no_grad():
+                return actor(scenario.observe(world_state, scenario_state, cfg)).clamp(-1.0, 1.0)
+
+        print(format_report(evaluate(config, mean_policy), f"variant_c_400/seed_{seed}"))
