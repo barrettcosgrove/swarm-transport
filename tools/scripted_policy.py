@@ -1,65 +1,76 @@
 import torch
-import torch.nn.functional as F
 from env.physics import circle_box_static_forces
 
-def scripted_policy(world_state, scenario_state, config):
+
+def scripted_policy(obs, config):
     """
     Returns: (E, n_agents, 2) actions in [-1, 1]
 
+    Same input as Actor.forward -- the per-agent observation from
+    scenario.observe -- so a comparison against a trained policy is not
+    the scripted controller reading privileged state the actor never gets.
+
     Not learned, not clever -- exists only to verify the task is solvable
-    with the current physics and reward before training anything.
+    with the current physics, reward, and observation before training anything.
     """
-    agent_pos = world_state.agent_pos                      # (E, N, 2)
-    payload_pos = world_state.payload_pos.unsqueeze(1)     # (E, 1, 2)
-    goal_pos = scenario_state.goal_pos.unsqueeze(1)        # (E, 1, 2)
+    n_others = config.n_agents - 1
+    scale = config.obs_pos_scale
+
+    own_pos = obs[..., 0:2]
+    goal_offset = obs[..., 4:6]
+    payload_offset = obs[..., 6:8]
+    rel_pos_other = obs[..., 10:10 + 2 * n_others].reshape(*obs.shape[:-1], n_others, 2)
+    predator_start = 10 + 4 * n_others + 1
+    predator_offset = obs[..., predator_start:predator_start + 2]
+
+    agent_pos = own_pos * scale
+    payload_off = payload_offset * scale
+    goal_off = goal_offset * scale
+    pred_off = predator_offset * scale
+    rel_pos = rel_pos_other * scale
 
     # ---- direction the payload needs to travel ----
-    to_goal = goal_pos - payload_pos                       # (E, 1, 2)
+    to_goal = goal_off - payload_off                       # (E, N, 2)
     goal_dir = to_goal / torch.clamp(torch.norm(to_goal, dim=-1, keepdim=True), min=1e-6)
 
-    # ---- the staging point behind the payload ----
-    push_point = payload_pos - goal_dir * config.push_standoff          # (E, 1, 2)
-
-    # ---- which mode is each agent in? ----
-    to_push_point = push_point - agent_pos                  # (E, N, 2)
-    dist_to_push_point = torch.norm(to_push_point, dim=-1, keepdim=True)   # (E, N, 1)
+    # ---- the staging point behind the payload, relative to the agent ----
+    to_push_point = payload_off - goal_dir * config.push_standoff
+    dist_to_push_point = torch.norm(to_push_point, dim=-1, keepdim=True)
     in_push_mode = dist_to_push_point < config.scripted_push_threshold
 
     approach_dir = to_push_point / torch.clamp(dist_to_push_point, min=1e-6)
-    steer = torch.where(in_push_mode, goal_dir.expand_as(approach_dir), approach_dir)
+    steer = torch.where(in_push_mode, goal_dir, approach_dir)
 
-    # ---- obstacle and wall repulsion ----
-    repulsion = _avoidance(agent_pos, world_state, config)  # (E, N, 2)
+    # ---- wall repulsion (own_pos is in the observation specifically for this) ----
+    repulsion = _avoidance(agent_pos, config)
     steer = steer + repulsion
 
-    # ---- break off and dodge when the predator closes in ----
-    steer = steer + _evasion(agent_pos, scenario_state, world_state, config)
+    # ---- break off and dodge when this agent is the closest to the predator ----
+    steer = steer + _evasion(pred_off, rel_pos, config)
 
     # ---- normalize to a valid action ----
     steer_norm = torch.clamp(torch.norm(steer, dim=-1, keepdim=True), min=1e-6)
     return steer / steer_norm
 
-def _avoidance(agent_pos, world_state, config):
+
+def _avoidance(agent_pos, config):
     """
-    Steering repulsion away from walls and obstacles.
+    Steering repulsion away from walls.
+
+    Obstacles are not in the observation -- they spawn per episode and
+    observe() never includes them -- so they cannot be avoided here.
+    Walls are fixed and own_pos is absolute, which is enough.
 
     Reuses circle_box_static_forces -- the collision force is already exactly
     "how hard is this thing pushing me away, and from what direction," which
-    is precisely the steering signal we want. Same trick as the collision
-    penalty in compute_reward: don't re-derive proximity detection, read it
-    off the physics you already trust.
+    is precisely the steering signal we want.
     """
     avoid_radius = config.agent_radius + config.scripted_avoid_margin
 
-    wall_push = circle_box_static_forces(
+    push = circle_box_static_forces(
         agent_pos, avoid_radius,
-        world_state.wall_center, world_state.wall_halfsize, 1.0
+        config.wall_center, config.wall_halfsize, 1.0
     )
-    obstacle_push = circle_box_static_forces(
-        agent_pos, avoid_radius,
-        world_state.obstacle_center, world_state.obstacle_halfsize, 1.0
-    )
-    push = wall_push + obstacle_push
 
     # perpendicular nudge -- prevents deadlock when repulsion points exactly
     # opposite the steering direction and the two cancel to zero
@@ -67,38 +78,35 @@ def _avoidance(agent_pos, world_state, config):
     return (push + 0.3 * perp) * config.scripted_avoid_gain
 
 
-def _evasion(agent_pos, scenario_state, world_state, config):
+def _evasion(pred_off, rel_pos, config):
     """
     Steering away from the predator, ramping up as it closes.
 
-    Only the agent the predator is committed to breaks off -- the rest keep
-    pushing. This is the part that matters: the predator guards the payload,
-    so it is nearly always close to whoever is in position to push, and an
-    every-agent rule empties the payload of pushers exactly when the team is
-    best placed to move it. Damage lands on whoever is in range regardless, so
-    one evader buys the same survival for a third of the cost.
+    Only the locally nearest agent breaks off -- the rest keep pushing.
+    The trained policy does not observe predator_target, so the committed
+    hunt cannot be read off scenario_state. Each agent sees predator_offset
+    and teammate relative positions, which is enough to tell whether it is
+    the closest: |predator - other| = |predator_offset - rel_pos_other|.
 
-    Reads the committed target straight off scenario_state rather than
-    re-deriving it. Recomputing the argmin here would disagree with the
-    predator the moment its commitment timer holds a target that is no longer
-    the nearest -- which is most of the time, and precisely when it matters.
+    This disagrees with the predator the moment its commitment timer holds
+    a target that is no longer the nearest. That is the information the
+    observation does not contain.
 
     Agents out-run the predator (20 against a 6.0 speed cap), so fleeing works;
     the aim is only to survive contact, not win a chase.
     """
-    predator_pos = world_state.predator_pos.unsqueeze(1)                  # (E, 1, 2)
-
-    to_agent = agent_pos - predator_pos                                   # (E, N, 2)
-    dist = torch.norm(to_agent, dim=-1, keepdim=True)
-    away = to_agent / torch.clamp(dist, min=1e-6)
+    dist = torch.norm(pred_off, dim=-1, keepdim=True)
+    # predator_offset is predator - agent, so away is the opposite
+    away = -pred_off / torch.clamp(dist, min=1e-6)
     urgency = torch.clamp(1.0 - dist / config.scripted_evade_radius, min=0.0)
 
-    hunted = F.one_hot(scenario_state.predator_target, num_classes=agent_pos.shape[1])
-    hunted = hunted.unsqueeze(-1).to(agent_pos.dtype)                     # (E, N, 1)
+    teammate_pred_dist = (pred_off.unsqueeze(-2) - rel_pos).norm(dim=-1)
+    closest = dist.squeeze(-1) <= teammate_pred_dist.min(dim=-1).values
+    closest = closest.unsqueeze(-1).to(pred_off.dtype)
 
     # sidestep instead of retreating straight back. A purely radial flee walks
     # the agent directly away from the payload and the predator just follows,
     # so the agent gives up ground every time without shaking anything off.
     tangent = torch.stack([-away[..., 1], away[..., 0]], dim=-1)
     evade = away + config.scripted_evade_tangent * tangent
-    return evade * urgency * hunted * config.scripted_evade_gain
+    return evade * urgency * closest * config.scripted_evade_gain

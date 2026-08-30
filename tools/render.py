@@ -1,13 +1,12 @@
 """
 tools/render.py
 
-Records episodes and writes them out as an animated GIF showing a 2x2 grid
-of environments running simultaneously.
+Records episodes and writes them out as an animated GIF.
 
 Deliberately two-phase:
-  1. record_episode() runs the simulation and stores a snapshot per step.
-     No drawing happens here -- matplotlib is far slower than physics, so
-     drawing inline would throttle the simulation to the render rate.
+  1. record_episode() / record_episodes() run the simulation and store
+     snapshots. No drawing happens here -- matplotlib is far slower than
+     physics, so drawing inline would throttle the simulation to the render rate.
   2. render_to_gif() walks those snapshots and draws them.
 
 Because the phases are separate, you can re-render the same recorded episode
@@ -20,13 +19,18 @@ Usage:
     render_to_gif(frames, "outputs/rollout.gif", config, fps=20, every=2)
 
     python -m tools.render
+    # 100-episode rollouts of the trained policy and the scripted controller,
+    # ranked, top wins as GIFs
 """
+import math
 import os
+from collections import deque
 from dataclasses import dataclass
 
 import matplotlib
 matplotlib.use("Agg")           # headless backend -- no display needed
 import matplotlib.pyplot as plt
+from matplotlib.colors import to_rgba
 from matplotlib.patches import Circle, Rectangle
 import numpy as np
 import imageio.v2 as imageio
@@ -45,6 +49,14 @@ COLOR_WALL = "#888888"           # grey
 COLOR_OBSTACLE = "#666666"
 COLOR_HEALTH_OK = "#4caf50"
 COLOR_HEALTH_LOW = "#d62728"
+
+# backtrack only counts as "near the goal" once closest approach is inside this
+# many success radii. Early wobble is already in max_backtrack; this term is
+# specifically the last-second bounce-out that makes a win look accidental.
+NEAR_GOAL_RADII = 2.0
+# payload halfsize is 0.2; a sliver of spring contact is expected, sliding
+# through a box is not. Wins above this max AABB penetration are dropped.
+MAX_OBSTACLE_PEN = 0.12
 
 
 # ---------------------------------------------------------------- recording
@@ -68,9 +80,62 @@ class Frame:
     took_damage: torch.Tensor      # (E,) bool -- health dropped this step
     at_goal: torch.Tensor          # (E,) bool -- payload within success radius
     terminated: torch.Tensor       # (E,) bool -- success or capture, this step
-    truncated: torch.Tensor        # (E,) bool -- hit max_steps, this step
+    truncated: torch.Tensor       # (E,) bool -- hit max_steps, this step
     win_count: torch.Tensor        # (E,) running total, carried forward every frame
     loss_count: torch.Tensor       # (E,) running total, carried forward every frame
+
+
+@dataclass
+class EpisodeRecord:
+    """One finished episode: the frames to draw plus the numbers that rank it."""
+    index: int
+    frames: list
+    won: bool
+    captured: bool
+    timed_out: bool
+    n_steps: int
+    start_dist: float
+    end_dist: float
+    end_health: float
+    damage: float
+    max_backtrack: float
+    near_goal_backtrack: float
+    push_efficiency: float
+    position_ratio: float
+    behind_frac: float
+    path_straightness: float
+    payload_progress: float
+    capture_occupancy: float
+    camping_time: float
+    mean_predator_dist: float
+    min_predator_dist: float
+    team_spread: float
+    evade_cosine: float
+    hunted_evade_cosine: float
+    hunted_thrust: float
+    closing_thrust: float
+    max_obstacle_pen: float
+    score: float = 0.0
+
+
+def _capture_frame(ws, ss, health_before, at_goal, terminated, truncated,
+                   win_count, loss_count):
+    return Frame(
+        agent_pos=ws.agent_pos.clone(),
+        predator_pos=ws.predator_pos.clone(),
+        payload_pos=ws.payload_pos.clone(),
+        goal_pos=ss.goal_pos.clone(),
+        obstacle_center=ws.obstacle_center.clone(),
+        obstacle_active=ws.obstacle_active.clone(),
+        health=ss.health.clone(),
+        step_count=ss.step_count.clone(),
+        took_damage=(ss.health < health_before),
+        at_goal=at_goal,
+        terminated=terminated.clone(),
+        truncated=truncated.clone(),
+        win_count=win_count.clone(),
+        loss_count=loss_count.clone(),
+    )
 
 
 def record_episode(env, policy, n_steps, training_progress=1.0):
@@ -106,28 +171,315 @@ def record_episode(env, policy, n_steps, training_progress=1.0):
         win_count = win_count + (terminated & at_goal).float()
         loss_count = loss_count + (terminated & ~at_goal).float() + (truncated & ~terminated).float()
 
-        frames.append(Frame(
-            agent_pos=ws.agent_pos.clone(),
-            predator_pos=ws.predator_pos.clone(),
-            payload_pos=ws.payload_pos.clone(),
-            goal_pos=ss.goal_pos.clone(),
-            obstacle_center=ws.obstacle_center.clone(),
-            obstacle_active=ws.obstacle_active.clone(),
-            health=ss.health.clone(),
-            step_count=ss.step_count.clone(),
-            took_damage=(ss.health < health_before),
-            at_goal=at_goal,
-            terminated=terminated.clone(),
-            truncated=truncated.clone(),
-            win_count=win_count.clone(),
-            loss_count=loss_count.clone(),
-        ))
-    
+        frames.append(_capture_frame(
+            ws, ss, health_before, at_goal, terminated, truncated,
+            win_count, loss_count))
+
     print(f"closest approach per env (threshold={env.config.success_threshold}):")
     for e in range(E):
         print(f"  env {e}: {min_payload_dist[e].item():.3f}")
 
     return frames
+
+
+class _EpisodeAccum:
+    """Running sums for one in-progress episode. Reset after every done."""
+
+    def __init__(self, start_dist, start_health):
+        self.start_dist = start_dist
+        self.start_health = start_health
+        self.frames = []
+        self.dists = []
+        self.payload_path = []
+        self.behind = 0
+        self.front = 0
+        self.behind_steps = 0
+        self.force_goal = 0.0
+        self.force_mag = 0.0
+        self.pred_sum = 0.0
+        self.pred_min = float("inf")
+        self.spread_sum = 0.0
+        self.n_beh = 0
+        self.max_obstacle_pen = 0.0
+        self.evade = {k: 0.0 for k in (
+            "evade_cosine_sum", "evade_count", "hunted_cosine_sum", "hunted_thrust_sum",
+            "hunted_count", "closing_thrust_sum", "closing_count",
+            "capture_hits", "agent_steps", "camping_hits", "env_steps")}
+
+    def add_evasion(self, stats):
+        for key, value in stats.items():
+            if key in self.evade:
+                self.evade[key] += value
+
+    def observe_step(self, ws, ss, info, config, e=0):
+        from env import scenario
+
+        behind_mask, front_mask = scenario.payload_side_masks(
+            ws, ss, config.push_zone_radius)
+        self.behind += int(behind_mask[e].sum())
+        self.front += int(front_mask[e].sum())
+        if bool(behind_mask[e].any()):
+            self.behind_steps += 1
+
+        goalward, magnitude = scenario.payload_goalward_force(ws, ss, config)
+        self.force_goal += float(goalward[e])
+        self.force_mag += float(magnitude[e])
+
+        pred = float((ws.agent_pos[e] - ws.predator_pos[e]).norm(dim=-1).min())
+        self.pred_sum += pred
+        self.pred_min = min(self.pred_min, pred)
+        centroid = ws.agent_pos[e].mean(dim=0)
+        self.spread_sum += float((ws.agent_pos[e] - centroid).norm(dim=-1).mean())
+        self.n_beh += 1
+
+        dist = float(info["payload_dist"][e])
+        self.dists.append(dist)
+        self.payload_path.append((
+            float(ws.payload_pos[e, 0]), float(ws.payload_pos[e, 1])))
+        self.max_obstacle_pen = max(
+            self.max_obstacle_pen, _payload_obstacle_penetration(ws, e))
+
+
+def _payload_obstacle_penetration(ws, e=0):
+    """Max AABB penetration of the payload into any active obstacle.
+
+    Same geometry as physics.box_box_forces: overlap on both axes, then the
+    axis of least penetration. Inactive obstacles are ignored.
+    """
+    delta = ws.payload_pos[e] - ws.obstacle_center[e]
+    overlap = (ws.payload_halfsize + ws.obstacle_halfsize) - torch.abs(delta)
+    overlap = torch.clamp(overlap, min=0.0)
+    penetration = overlap.min(dim=-1).values
+    penetration = torch.where(ws.obstacle_active[e], penetration, torch.zeros_like(penetration))
+    return float(penetration.max()) if penetration.numel() else 0.0
+
+
+def _backtrack_stats(dists, near_radius):
+    """Max distance the payload ever gave back after a closer approach.
+
+    `near_goal_backtrack` is the same quantity gated to after the payload has
+    already been inside `near_radius` of the goal -- a last-second bounce-out
+    that max_backtrack would otherwise treat the same as an early wobble.
+    """
+    min_so_far = float("inf")
+    max_backtrack = 0.0
+    near_goal_backtrack = 0.0
+    for dist in dists:
+        if dist < min_so_far:
+            min_so_far = dist
+        backtrack = dist - min_so_far
+        if backtrack > max_backtrack:
+            max_backtrack = backtrack
+        if min_so_far <= near_radius and backtrack > near_goal_backtrack:
+            near_goal_backtrack = backtrack
+    return max_backtrack, near_goal_backtrack
+
+
+def _path_straightness(payload_path, start_dist):
+    if len(payload_path) < 2:
+        return 0.0
+    diffs = np.diff(np.asarray(payload_path, dtype=np.float64), axis=0)
+    path_len = float(np.linalg.norm(diffs, axis=1).sum())
+    if path_len <= 1e-6:
+        return 0.0
+    return start_dist / path_len
+
+
+def _ratio(total, n, default=0.0):
+    return total / n if n else default
+
+
+def _clip01(value):
+    return max(0.0, min(1.0, value))
+
+
+def _finalize_episode(index, accum, won, captured, timed_out, n_steps,
+                      end_health, end_dist, config):
+    max_backtrack, near_goal_backtrack = _backtrack_stats(
+        accum.dists, NEAR_GOAL_RADII * config.success_threshold)
+    evade = accum.evade
+    return EpisodeRecord(
+        index=index,
+        frames=accum.frames,
+        won=won,
+        captured=captured,
+        timed_out=timed_out,
+        n_steps=n_steps,
+        start_dist=accum.start_dist,
+        end_dist=end_dist,
+        end_health=end_health,
+        damage=max(accum.start_health - end_health, 0.0),
+        max_backtrack=max_backtrack,
+        near_goal_backtrack=near_goal_backtrack,
+        push_efficiency=_ratio(accum.force_goal, accum.force_mag),
+        position_ratio=accum.behind / max(accum.front, 1),
+        behind_frac=_ratio(accum.behind_steps, max(n_steps, 1)),
+        path_straightness=_path_straightness(accum.payload_path, accum.start_dist),
+        payload_progress=accum.start_dist - end_dist,
+        capture_occupancy=_ratio(evade["capture_hits"], evade["agent_steps"]),
+        camping_time=_ratio(evade["camping_hits"], evade["env_steps"]),
+        mean_predator_dist=_ratio(accum.pred_sum, accum.n_beh, default=float("nan")),
+        min_predator_dist=accum.pred_min if accum.pred_min < float("inf") else float("nan"),
+        team_spread=_ratio(accum.spread_sum, accum.n_beh, default=float("nan")),
+        evade_cosine=_ratio(evade["evade_cosine_sum"], evade["evade_count"], default=0.0),
+        hunted_evade_cosine=_ratio(
+            evade["hunted_cosine_sum"], evade["hunted_count"], default=0.0),
+        hunted_thrust=_ratio(evade["hunted_thrust_sum"], evade["hunted_count"], default=0.0),
+        closing_thrust=_ratio(evade["closing_thrust_sum"], evade["closing_count"], default=0.0),
+        max_obstacle_pen=accum.max_obstacle_pen,
+    )
+
+
+def score_episode(ep, config):
+    """Higher is a better demo clip. All terms in [0, 1].
+
+    Primary weight sits on the things that read on camera: a short win, no
+    reverse at the goal, and agents actually pushing from behind. Secondary
+    terms dump lucky-but-ugly wins (low health, camping predator, time spent
+    inside the capture ring, a scribbled payload path).
+    """
+    decisiveness = 1.0 - ep.n_steps / max(config.max_steps, 1)
+    smoothness = 1.0 / (1.0 + ep.max_backtrack)
+    near_goal = 1.0 / (1.0 + 4.0 * ep.near_goal_backtrack)
+    push = _clip01(ep.push_efficiency)
+    position = ep.position_ratio / (ep.position_ratio + 1.0)
+    behind = _clip01(ep.behind_frac)
+    health = _clip01(ep.end_health / config.max_health)
+    damage_ok = 1.0 - _clip01(ep.damage / config.max_health)
+    straight = _clip01(ep.path_straightness)
+    progress = _clip01(ep.payload_progress / max(ep.start_dist, 1e-6))
+    occupancy = 1.0 - _clip01(ep.capture_occupancy)
+    camping = 1.0 - _clip01(ep.camping_time)
+    evade = 0.5 * (ep.evade_cosine + 1.0)
+    hunted = 0.5 * (ep.hunted_evade_cosine + 1.0)
+    pred = 0.5 if math.isnan(ep.mean_predator_dist) else _clip01(ep.mean_predator_dist / 2.5)
+    if math.isnan(ep.team_spread):
+        spread = 0.5
+    else:
+        spread = math.exp(-((ep.team_spread - 1.1) ** 2) / (2 * 0.6 ** 2))
+
+    return (
+        0.16 * decisiveness
+        + 0.14 * smoothness
+        + 0.12 * near_goal
+        + 0.12 * push
+        + 0.07 * position
+        + 0.05 * behind
+        + 0.08 * health
+        + 0.04 * damage_ok
+        + 0.05 * straight
+        + 0.03 * progress
+        + 0.04 * occupancy
+        + 0.03 * camping
+        + 0.02 * evade
+        + 0.02 * hunted
+        + 0.02 * pred
+        + 0.01 * spread
+    )
+
+
+def rank_episodes(episodes, config, max_obstacle_pen=MAX_OBSTACLE_PEN):
+    """Score every episode, return wins sorted best-first.
+
+    Wins whose payload slid through an obstacle (max AABB penetration above
+    `max_obstacle_pen`) are dropped so a demo cannot open on a tunneling clip.
+    """
+    for ep in episodes:
+        ep.score = score_episode(ep, config)
+    wins = [ep for ep in episodes if ep.won]
+    clean = [ep for ep in wins if ep.max_obstacle_pen <= max_obstacle_pen]
+    dropped = len(wins) - len(clean)
+    if dropped:
+        print(f"dropped {dropped}/{len(wins)} wins with obstacle penetration > {max_obstacle_pen}")
+    return sorted(clean, key=lambda ep: ep.score, reverse=True)
+
+
+def format_ranking(ranked, n=15):
+    header = (f"{'#':>3} {'idx':>4} {'score':>6} {'steps':>5} {'back':>6} {'ngbk':>6}"
+              f"{'pshE':>6} {'posR':>6} {'bhnd':>5} {'hp':>6} {'capO':>5} {'strt':>5}"
+              f"{'camp':>5} {'obsP':>6}")
+    lines = [header]
+    for i, ep in enumerate(ranked[:n], start=1):
+        lines.append(
+            f"{i:>3} {ep.index:>4} {ep.score:>6.3f} {ep.n_steps:>5}"
+            f" {ep.max_backtrack:>6.3f} {ep.near_goal_backtrack:>6.3f}"
+            f" {ep.push_efficiency:>5.1%} {ep.position_ratio:>6.2f}"
+            f" {ep.behind_frac:>5.0%} {ep.end_health:>6.1f}"
+            f" {ep.capture_occupancy:>4.0%} {ep.path_straightness:>5.2f}"
+            f" {ep.camping_time:>4.0%} {ep.max_obstacle_pen:>6.3f}"
+        )
+    return "\n".join(lines)
+
+
+def record_episodes(env, policy, n_episodes, training_progress=1.0):
+    """Run one environment until `n_episodes` have finished. No drawing.
+
+    Metrics are accumulated live (forces, side masks, evasion) so ranking does
+    not have to reconstruct them from positions after the fact. Frames are
+    kept per episode so a later select can stitch a GIF without re-simulating.
+    """
+    from env import scenario
+
+    env.reset()
+    config = env.config
+    e = 0
+    episodes = []
+    win_count = torch.zeros(config.num_envs)
+    loss_count = torch.zeros(config.num_envs)
+
+    def new_accum():
+        start_dist = float(torch.norm(
+            env.world_state.payload_pos[e] - env.scenario_state.goal_pos[e]))
+        start_health = float(env.scenario_state.health[e])
+        return _EpisodeAccum(start_dist, start_health)
+
+    accum = new_accum()
+    max_total_steps = n_episodes * config.max_steps + config.max_steps
+
+    for _ in range(max_total_steps):
+        if len(episodes) >= n_episodes:
+            break
+
+        ws, ss = env.world_state, env.scenario_state
+        actions = policy(ws, ss, config)
+        accum.add_evasion(scenario.evasion_step_stats(ws, ss, actions, config))
+        health_before = ss.health.clone()
+        _, _, terminated, truncated, info = env.step(actions, training_progress)
+        ws, ss = info["world_state"], info["scenario_state"]
+        at_goal = info["success"]
+
+        # push / path stats on the pre-reset board, same as tools.evaluate
+        accum.observe_step(ws, ss, info, config, e=e)
+
+        won_now = bool(terminated[e] and at_goal[e])
+        captured_now = bool(terminated[e] and not at_goal[e])
+        timed_out_now = bool(truncated[e] and not terminated[e])
+        win_count = win_count + (terminated & at_goal).float()
+        loss_count = loss_count + (terminated & ~at_goal).float() + (truncated & ~terminated).float()
+
+        accum.frames.append(_capture_frame(
+            ws, ss, health_before, at_goal, terminated, truncated,
+            win_count, loss_count))
+
+        if won_now or captured_now or timed_out_now:
+            n_steps = int(ss.step_count[e])
+            episodes.append(_finalize_episode(
+                index=len(episodes),
+                accum=accum,
+                won=won_now,
+                captured=captured_now,
+                timed_out=timed_out_now,
+                n_steps=n_steps,
+                end_health=float(ss.health[e]),
+                end_dist=float(info["payload_dist"][e]),
+                config=config,
+            ))
+            accum = new_accum()
+    else:
+        raise RuntimeError(
+            f"finished {len(episodes)}/{n_episodes} episodes before the step cap")
+
+    return episodes
 
 
 # ---------------------------------------------------------------- drawing
@@ -165,13 +517,24 @@ class _PanelArtists:
     what makes rendering a full episode take seconds instead of a minute.
     """
 
-    def __init__(self, ax, config, n_agents, n_obstacles):
-        lim = compute_arena_limit(config)
+    def __init__(self, ax, config, n_agents, n_obstacles, arena_margin=1.15,
+                 show_diagnostics=True, show_tally=True, show_health_value=False,
+                 payload_trail=False, body_trail_len=0, filled_goal=False,
+                 prominent_banner=False):
+        lim = compute_arena_limit(config, margin=arena_margin)
         ax.set_xlim(-lim, lim)
         ax.set_ylim(-lim, lim)
         ax.set_aspect("equal")
         ax.set_xticks([])
         ax.set_yticks([])
+
+        self.show_diagnostics = show_diagnostics
+        self.show_tally = show_tally
+        self.show_health_value = show_health_value
+        self.use_payload_trail = payload_trail
+        self.body_trail_len = body_trail_len
+        self.n_agents = n_agents
+        self._last_step = None
 
         # walls never move -- draw once, never touch again
         for wc, wh in zip(config.wall_center, config.wall_halfsize):
@@ -187,32 +550,58 @@ class _PanelArtists:
             hw = float(oh[i][0]) if oh.dim() > 1 else float(oh[0])
             hh = float(oh[i][1]) if oh.dim() > 1 else float(oh[1])
             patch = Rectangle((0, 0), 2 * hw, 2 * hh,
-                               facecolor=COLOR_OBSTACLE, edgecolor="none", zorder=2)
+                               facecolor=COLOR_OBSTACLE, edgecolor="none", zorder=5.5)
             self.obstacle_halfsize = (hw, hh)
             ax.add_patch(patch)
             self.obstacles.append(patch)
 
-        # hollow + dashed so the payload stays visible once it moves inside
-        self.goal = Circle((0, 0), config.success_threshold, facecolor="none",
-                            edgecolor=COLOR_GOAL, linestyle="--", linewidth=2, zorder=3)
+        if filled_goal:
+            self.goal = Circle(
+                (0, 0), config.success_threshold,
+                facecolor=to_rgba(COLOR_GOAL, 0.18),
+                edgecolor=COLOR_GOAL, linestyle=":", linewidth=2.2, zorder=3)
+        else:
+            # hollow + dashed so the payload stays visible once it moves inside
+            self.goal = Circle((0, 0), config.success_threshold, facecolor="none",
+                                edgecolor=COLOR_GOAL, linestyle="--", linewidth=2, zorder=3)
         ax.add_patch(self.goal)
+
+        self.payload_xs = []
+        self.payload_ys = []
+        self.payload_trail, = ax.plot(
+            [], [], color=COLOR_PAYLOAD, lw=2.8, alpha=0.75, zorder=3.5,
+            solid_capstyle="round")
+        self.payload_trail.set_visible(payload_trail)
+
+        self.agent_hist = [deque(maxlen=max(body_trail_len, 1)) for _ in range(n_agents)]
+        self.agent_trails = []
+        for _ in range(n_agents):
+            line, = ax.plot([], [], color=COLOR_AGENT, lw=1.6, alpha=0.55,
+                             zorder=5.7, solid_capstyle="round")
+            line.set_visible(body_trail_len > 0)
+            self.agent_trails.append(line)
+        self.predator_hist = deque(maxlen=max(body_trail_len, 1))
+        self.predator_trail, = ax.plot(
+            [], [], color=COLOR_PREDATOR, lw=1.8, alpha=0.6, zorder=5.7,
+            solid_capstyle="round")
+        self.predator_trail.set_visible(body_trail_len > 0)
 
         ph = config.payload_halfsize
         self.payload_halfsize = (float(ph[0]), float(ph[1]))
         self.payload = Rectangle((0, 0), 2 * self.payload_halfsize[0],
                                    2 * self.payload_halfsize[1],
-                                   facecolor=COLOR_PAYLOAD, edgecolor="none", zorder=4)
+                                   facecolor=COLOR_PAYLOAD, edgecolor="none", zorder=5)
         ax.add_patch(self.payload)
 
         self.agents = []
         for _ in range(n_agents):
             patch = Circle((0, 0), config.agent_radius, facecolor=COLOR_AGENT,
-                            edgecolor="none", zorder=5)
+                            edgecolor="none", zorder=6)
             ax.add_patch(patch)
             self.agents.append(patch)
 
         self.predator = Circle((0, 0), config.predator_radius,
-                                facecolor=COLOR_PREDATOR, edgecolor="none", zorder=5)
+                                facecolor=COLOR_PREDATOR, edgecolor="none", zorder=6)
         ax.add_patch(self.predator)
 
         # capture radius is larger than the body and is what actually drains
@@ -224,22 +613,35 @@ class _PanelArtists:
 
         self.text = ax.text(0.02, 0.98, "", transform=ax.transAxes,
                              va="top", ha="left", fontsize=7, family="monospace")
+        self.text.set_visible(show_diagnostics)
 
         # persistent tally, always visible, separate from the transient outcome banner
         self.tally = ax.text(0.02, 0.02, "", transform=ax.transAxes,
                               va="bottom", ha="left", fontsize=8, family="monospace",
                               weight="bold")
+        self.tally.set_visible(show_tally)
 
-        # outcome banner -- hidden by default, shown only on the frame(s) an
-        # episode ends. Covers most of the panel so it's impossible to miss
-        # even while skimming a fast-moving grid.
-        self.banner_bg = Rectangle((0.1, 0.4), 0.8, 0.2, transform=ax.transAxes,
-                                     facecolor="white", edgecolor="black", linewidth=1.5,
-                                     alpha=0.9, zorder=20, visible=False)
+        # a light veil over the whole panel so WIN / CAPTURED / TIMEOUT read
+        # even when the last-frame motion is busy. Hidden until an episode ends.
+        self.outcome_veil = Rectangle(
+            (0.0, 0.0), 1.0, 1.0, transform=ax.transAxes,
+            facecolor="white", edgecolor="none", alpha=0.0, zorder=19, visible=False)
+        ax.add_patch(self.outcome_veil)
+
+        if prominent_banner:
+            banner_xy, banner_w, banner_h, banner_fs = (0.10, 0.34), 0.80, 0.32, 28
+        else:
+            banner_xy, banner_w, banner_h, banner_fs = (0.10, 0.40), 0.80, 0.20, 16
+        self.banner_bg = Rectangle(
+            banner_xy, banner_w, banner_h, transform=ax.transAxes,
+            facecolor="white", edgecolor="black", linewidth=2.0 if prominent_banner else 1.5,
+            alpha=0.94, zorder=20, visible=False)
         ax.add_patch(self.banner_bg)
-        self.banner_text = ax.text(0.5, 0.5, "", transform=ax.transAxes,
-                                     va="center", ha="center", fontsize=16, weight="bold",
-                                     zorder=21, visible=False)
+        self.banner_text = ax.text(0.5, banner_xy[1] + banner_h / 2, "",
+                                     transform=ax.transAxes,
+                                     va="center", ha="center", fontsize=banner_fs,
+                                     weight="bold", zorder=21, visible=False)
+        self.prominent_banner = prominent_banner
 
         # health bar: a grey background track with a colored fill on top.
         # transform=ax.transAxes puts these in panel-relative coordinates
@@ -252,6 +654,21 @@ class _PanelArtists:
                                       facecolor=COLOR_HEALTH_OK, edgecolor="none", zorder=11)
         self.health_bar_width = bar_w
         ax.add_patch(self.health_bar)
+        self.health_label = ax.text(
+            bar_x - 0.02, bar_y + bar_h / 2, "", transform=ax.transAxes,
+            va="center", ha="right", fontsize=9, family="monospace",
+            weight="bold", zorder=12)
+        self.health_label.set_visible(show_health_value)
+
+    def _reset_trails(self):
+        self.payload_xs = []
+        self.payload_ys = []
+        self.payload_trail.set_data([], [])
+        for hist, line in zip(self.agent_hist, self.agent_trails):
+            hist.clear()
+            line.set_data([], [])
+        self.predator_hist.clear()
+        self.predator_trail.set_data([], [])
 
     def update(self, frame, e, config):
         for i, patch in enumerate(self.obstacles):
@@ -266,44 +683,73 @@ class _PanelArtists:
         gx, gy = frame.goal_pos[e]
         self.goal.center = (float(gx), float(gy))
 
-        px, py = frame.payload_pos[e]
-        self.payload.set_xy((float(px) - self.payload_halfsize[0],
-                              float(py) - self.payload_halfsize[1]))
+        px, py = float(frame.payload_pos[e][0]), float(frame.payload_pos[e][1])
+        self.payload.set_xy((px - self.payload_halfsize[0],
+                              py - self.payload_halfsize[1]))
         self.payload.set_facecolor(
             COLOR_PAYLOAD_SUCCESS if bool(frame.at_goal[e]) else COLOR_PAYLOAD
         )
 
         hurt = bool(frame.took_damage[e])
+        agent_xy = []
         for i, patch in enumerate(self.agents):
-            ax_, ay_ = frame.agent_pos[e, i]
-            patch.center = (float(ax_), float(ay_))
+            ax_, ay_ = float(frame.agent_pos[e, i][0]), float(frame.agent_pos[e, i][1])
+            patch.center = (ax_, ay_)
             patch.set_facecolor(COLOR_AGENT_HURT if hurt else COLOR_AGENT)
+            agent_xy.append((ax_, ay_))
 
-        rx, ry = frame.predator_pos[e]
-        self.predator.center = (float(rx), float(ry))
-        self.capture.center = (float(rx), float(ry))
+        rx, ry = float(frame.predator_pos[e][0]), float(frame.predator_pos[e][1])
+        self.predator.center = (rx, ry)
+        self.capture.center = (rx, ry)
+
+        step = int(frame.step_count[e])
+        if self._last_step is not None and step < self._last_step:
+            self._reset_trails()
+        new_sample = self._last_step != step or not self.payload_xs
+        if new_sample:
+            if self.use_payload_trail:
+                self.payload_xs.append(px)
+                self.payload_ys.append(py)
+                self.payload_trail.set_data(self.payload_xs, self.payload_ys)
+            if self.body_trail_len > 0:
+                for hist, line, (ax_, ay_) in zip(
+                        self.agent_hist, self.agent_trails, agent_xy):
+                    hist.append((ax_, ay_))
+                    xs = [p[0] for p in hist]
+                    ys = [p[1] for p in hist]
+                    line.set_data(xs, ys)
+                self.predator_hist.append((rx, ry))
+                self.predator_trail.set_data(
+                    [p[0] for p in self.predator_hist],
+                    [p[1] for p in self.predator_hist])
+        self._last_step = step
 
         health = float(frame.health[e])
         max_health = config.max_health
-        step = int(frame.step_count[e])
-        dist = float(torch.norm(frame.payload_pos[e] - frame.goal_pos[e]))
 
-        self.text.set_text(
-            f"env {e}\n"
-            f"health {health:5.1f}/{max_health:.0f}\n"
-            f"step   {step:3d}/{config.max_steps}\n"
-            f"dist   {dist:5.2f}"
-        )
+        if self.show_diagnostics:
+            dist = float(torch.norm(frame.payload_pos[e] - frame.goal_pos[e]))
+            self.text.set_text(
+                f"env {e}\n"
+                f"health {health:5.1f}/{max_health:.0f}\n"
+                f"step   {step:3d}/{config.max_steps}\n"
+                f"dist   {dist:5.2f}"
+            )
 
         frac = max(health, 0.0) / max_health
         self.health_bar.set_width(self.health_bar_width * frac)
         self.health_bar.set_facecolor(
             COLOR_HEALTH_LOW if frac < 0.3 else COLOR_HEALTH_OK
         )
+        if self.show_health_value:
+            self.health_label.set_text(f"{health:.0f}/{max_health:.0f}")
+            self.health_label.set_color(
+                COLOR_HEALTH_LOW if frac < 0.3 else COLOR_HEALTH_OK)
 
-        wins = int(frame.win_count[e])
-        losses = int(frame.loss_count[e])
-        self.tally.set_text(f"W {wins}  L {losses}")
+        if self.show_tally:
+            wins = int(frame.win_count[e])
+            losses = int(frame.loss_count[e])
+            self.tally.set_text(f"W {wins}  L {losses}")
 
         # outcome banner: only visible on the exact frame(s) an episode ended.
         # Since render_to_gif redraws this SAME frame repeatedly during a
@@ -314,21 +760,32 @@ class _PanelArtists:
         timed_out = bool(frame.truncated[e] and not frame.terminated[e])
 
         if won or captured or timed_out:
+            self.outcome_veil.set_visible(True)
             self.banner_bg.set_visible(True)
             self.banner_text.set_visible(True)
             if won:
-                self.banner_bg.set_facecolor("#d4f7d4")
+                veil = to_rgba(COLOR_PAYLOAD_SUCCESS, 0.22 if self.prominent_banner else 0.10)
+                self.outcome_veil.set_facecolor(veil)
+                self.banner_bg.set_facecolor("#b7efb7")
+                self.banner_bg.set_edgecolor(COLOR_PAYLOAD_SUCCESS)
                 self.banner_text.set_text("WIN")
                 self.banner_text.set_color(COLOR_PAYLOAD_SUCCESS)
             elif captured:
-                self.banner_bg.set_facecolor("#fadada")
+                veil = to_rgba(COLOR_PREDATOR, 0.22 if self.prominent_banner else 0.10)
+                self.outcome_veil.set_facecolor(veil)
+                self.banner_bg.set_facecolor("#f5b5b5")
+                self.banner_bg.set_edgecolor(COLOR_PREDATOR)
                 self.banner_text.set_text("CAPTURED")
                 self.banner_text.set_color(COLOR_PREDATOR)
             else:
-                self.banner_bg.set_facecolor("#f0f0f0")
+                veil = to_rgba("#555555", 0.18 if self.prominent_banner else 0.08)
+                self.outcome_veil.set_facecolor(veil)
+                self.banner_bg.set_facecolor("#e4e4e4")
+                self.banner_bg.set_edgecolor("#555555")
                 self.banner_text.set_text("TIMEOUT")
                 self.banner_text.set_color("#555555")
         else:
+            self.outcome_veil.set_visible(False)
             self.banner_bg.set_visible(False)
             self.banner_text.set_visible(False)
 
@@ -345,16 +802,36 @@ def _build_panel_schedule(frames, panel_idx, every, hold_frames):
     four independent episodes side by side.
     """
     schedule = []
-    for i in range(0, len(frames), every):
+    i = 0
+    n = len(frames)
+    while i < n:
         schedule.append(i)
         ended = bool(frames[i].terminated[panel_idx] or frames[i].truncated[panel_idx])
         if ended:
             schedule.extend([i] * hold_frames)
+            i += every
+            continue
+        # `every` would skip a terminal sitting on an odd index; freeze on it
+        # anyway so a stitched demo cannot drop a WIN / CAPTURED / TIMEOUT hold.
+        terminal = None
+        for j in range(i + 1, min(i + every, n)):
+            if bool(frames[j].terminated[panel_idx] or frames[j].truncated[panel_idx]):
+                terminal = j
+                break
+        if terminal is not None:
+            schedule.append(terminal)
+            schedule.extend([terminal] * hold_frames)
+            i = terminal + 1
+        else:
+            i += every
     return schedule
 
 
-def render_to_gif(frames, output_path, config, fps=20, every=1, n_panels=4, hold_seconds=1.5):
-    """Draw recorded frames as a 2x2 grid and write an animated GIF.
+def render_to_gif(frames, output_path, config, fps=20, every=1, n_panels=4,
+                  hold_seconds=1.5, arena_margin=1.15, show_diagnostics=True,
+                  show_tally=True, show_health_value=False, payload_trail=False,
+                  body_trail_len=0, filled_goal=False, prominent_banner=False):
+    """Draw recorded frames and write an animated GIF.
 
     `every` skips frames at DRAW time, not record time -- so you can render
     a quick low-frame-count version and a detailed one from the same
@@ -373,13 +850,26 @@ def render_to_gif(frames, output_path, config, fps=20, every=1, n_panels=4, hold
     n_obstacles = frames[0].obstacle_center.shape[1]
     hold_frames = int(round(hold_seconds * fps))
 
-    fig, axes = plt.subplots(2, 2, figsize=(8, 8), dpi=80)
-    axes = axes.flatten()
-    for ax in axes[n_panels:]:
-        ax.set_visible(False)
+    if n_panels == 1:
+        fig, ax = plt.subplots(1, 1, figsize=(6.4, 6.4), dpi=100)
+        axes = [ax]
+    else:
+        fig, axes = plt.subplots(2, 2, figsize=(8, 8), dpi=80)
+        axes = axes.flatten()
+        for ax in axes[n_panels:]:
+            ax.set_visible(False)
 
-    artists = [_PanelArtists(axes[e], config, n_agents, n_obstacles)
-               for e in range(n_panels)]
+    artists = [_PanelArtists(
+        axes[e], config, n_agents, n_obstacles,
+        arena_margin=arena_margin,
+        show_diagnostics=show_diagnostics,
+        show_tally=show_tally,
+        show_health_value=show_health_value,
+        payload_trail=payload_trail,
+        body_trail_len=body_trail_len,
+        filled_goal=filled_goal,
+        prominent_banner=prominent_banner,
+    ) for e in range(n_panels)]
     fig.tight_layout()
 
     # one schedule per panel, since panels can hold at different points and
@@ -405,8 +895,45 @@ def render_to_gif(frames, output_path, config, fps=20, every=1, n_panels=4, hold
     plt.close(fig)
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    imageio.mimsave(output_path, images, fps=fps)
+    # loop=0 writes the Netscape 2.0 extension (infinite loop). Without it
+    # GitHub and most markdown previews show the GIF as a still first frame.
+    imageio.mimsave(output_path, images, fps=fps, loop=0)
     return output_path
+
+
+DEMO_RENDER_KWARGS = dict(
+    fps=10, every=2, n_panels=1, hold_seconds=3.5,
+    arena_margin=1.02, show_diagnostics=False, show_tally=False,
+    show_health_value=True, payload_trail=True, body_trail_len=12,
+    filled_goal=True, prominent_banner=True,
+)
+
+
+def render_policy_demo(env, policy, output_path, label, n_episodes=100, n_pick=6):
+    """Collect, rank, and write a single-panel demo GIF for any policy."""
+    print(f"recording {n_episodes} episodes ({label}) ...", flush=True)
+    episodes = record_episodes(env, policy, n_episodes=n_episodes)
+    n_wins = sum(1 for ep in episodes if ep.won)
+    n_cap = sum(1 for ep in episodes if ep.captured)
+    n_to = sum(1 for ep in episodes if ep.timed_out)
+    print(f"collected {len(episodes)} episodes  ({n_wins} wins, {n_cap} captures, {n_to} timeouts)")
+
+    ranked = rank_episodes(episodes, env.config)
+    print(format_ranking(ranked))
+    selected = ranked[:n_pick]
+    if not selected:
+        raise RuntimeError(f"no winning episodes to render for {label}")
+
+    print(f"selected {len(selected)} of {len(ranked)} clean wins:")
+    for i, ep in enumerate(selected, start=1):
+        print(f"  {i}. episode {ep.index}  score={ep.score:.3f}  steps={ep.n_steps}"
+              f"  back={ep.max_backtrack:.3f}  push={ep.push_efficiency:.1%}"
+              f"  hp={ep.end_health:.0f}  obsP={ep.max_obstacle_pen:.3f}")
+
+    frames = [frame for ep in selected for frame in ep.frames]
+    path = render_to_gif(frames, output_path, env.config, **DEMO_RENDER_KWARGS)
+    print(f"wrote {path}")
+    return path
 
 
 # ---------------------------------------------------------------- entry point
@@ -417,20 +944,28 @@ if __name__ == "__main__":
     from train.config import Config
     from train.checkpoints import load_checkpoint
     from train.mappo import Actor, Critic
+    from tools.scripted_policy import scripted_policy
 
-    CHECKPOINT = "train/checkpoints/preview_100_push_reward/checkpoint_100.pt"
+    CHECKPOINT = "train/checkpoints/variant_c_400/seed_4/checkpoint_best.pt"
+    N_EPISODES = 100
+    N_PICK = 6
 
-    config = Config(num_envs=4)
+    config = Config(num_envs=1, seed=0)
     actor = Actor(config.obs_dim, 2, config.hidden_dim)
     critic = Critic(config.obs_dim, config.n_agents, config.hidden_dim)
     load_checkpoint(CHECKPOINT, actor, critic)
     actor.eval()
 
-    def actor_policy(world_state, scenario_state, cfg):
+    def actor_policy(world_state, scenario_state, cfg, actor=actor):
         with torch.no_grad():
             return actor(scenario.observe(world_state, scenario_state, cfg)).clamp(-1.0, 1.0)
 
-    env = Env(config)
-    frames = record_episode(env, actor_policy, n_steps=config.max_steps)
-    path = render_to_gif(frames, "outputs/actor_rollout.gif", config, fps=8, every=2, hold_seconds=1.5)
-    print(f"wrote {path}")
+    def scripted_wrapper(world_state, scenario_state, cfg):
+        return scripted_policy(scenario.observe(world_state, scenario_state, cfg), cfg)
+
+    render_policy_demo(
+        Env(config), actor_policy, "outputs/actor_variant_c_400_seed_4_demo.gif",
+        label=CHECKPOINT, n_episodes=N_EPISODES, n_pick=N_PICK)
+    render_policy_demo(
+        Env(config), scripted_wrapper, "outputs/scripted_demo.gif",
+        label="scripted", n_episodes=N_EPISODES, n_pick=N_PICK)
