@@ -6,11 +6,11 @@ A custom vectorized multi-agent simulator in PyTorch. Five agents, trained with 
 
 **Trained policy** — production MAPPO checkpoint (`variant_c_400/seed_4/checkpoint_best.pt`). Best periodic eval **70.5% win / 14.1% capture** (iter 300). Final eval **67.4% win / 10.6% capture / 22.0% timeout**; mean win in 322 steps, end health ~82.
 
-![Trained policy](outputs/actor_variant_c_400_seed_4_demo.gif)
+<video src="outputs/actor_variant_c_400_seed_4_demo.mp4" width="640" autoplay loop muted playsinline controls></video>
 
 **Scripted policy** — hand-written approach → push → evade controller. Same 32-dim local observation as the actor. Solvability check and benchmark, not a learned policy.
 
-![Scripted policy](outputs/scripted_demo.gif)
+<video src="outputs/scripted_demo.mp4" width="640" autoplay loop muted playsinline controls></video>
 
 `python -m tools.evaluate` scores both policies on the same metrics. Control died about as often as it won; seed 4 cut capture by ~3× and learned who stands behind the crate.
 
@@ -62,7 +62,7 @@ Every 25 iterations: `checkpoint_latest.pt`. Every 100: a numbered snapshot. Per
 
 ### Rendering
 
-`tools/render.py` records the episode, then draws it (matplotlib + imageio). Walls, obstacles, agents (red flash on damage), predator, payload (green on success), goal, health bar, optional trails. Demo GIFs pick the cleanest wins from 100 episodes.
+`tools/render.py` records the episode, then draws it (matplotlib + imageio). Dark arena, drop shadows, numbered agents, velocity ticks, predator lock-on and cooldown, push-zone tint, solid goal ring, health bar. Demo MP4s pick the 6 cleanest wins from 100 episodes.
 
 ### Logging
 
@@ -129,7 +129,7 @@ swarm-transport/
 ├── tools/
 │   ├── train_seeds.py    7 × 400 production run
 │   ├── evaluate.py       Scripted vs trained eval
-│   ├── render.py         Demo GIFs
+│   ├── render.py         Demo MP4s
 │   ├── render_seeds.py   Per-seed GIFs
 │   ├── scripted_policy.py
 │   ├── calibrate.py
@@ -138,7 +138,7 @@ swarm-transport/
 │   ├── freeze_probe.py
 │   └── static_reward_probe.py
 ├── tests/                Physics, env, reward invariants, GAE
-├── outputs/              GIFs and training JSON
+├── outputs/              Demo MP4s and training JSON
 └── requirements.txt
 ```
 
@@ -158,7 +158,7 @@ pytest tests/ -q
 python -m train.mappo              # one seed, 400 iter; Config.device = "cpu" or "cuda"
 python -m tools.train_seeds        # 7 seeds → outputs/variant_c_400.json
 python -m tools.evaluate           # scripted vs each seed's best
-python -m tools.render             # demo GIFs
+python -m tools.render             # demo MP4s
 ```
 
 Preview a run without changing the LR schedule: `MAPPOTrainer(config).train(max_iterations=30)` — annealing still uses the full 400. Resume: `trainer.load("train/checkpoints/checkpoint_latest.pt")`.

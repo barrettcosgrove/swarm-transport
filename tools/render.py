@@ -1,26 +1,26 @@
 """
 tools/render.py
 
-Records episodes and writes them out as an animated GIF.
+Records episodes and writes them out as GIF or MP4.
 
 Deliberately two-phase:
   1. record_episode() / record_episodes() run the simulation and store
      snapshots. No drawing happens here -- matplotlib is far slower than
      physics, so drawing inline would throttle the simulation to the render rate.
-  2. render_to_gif() walks those snapshots and draws them.
+  2. render_video() walks those snapshots and draws them.
 
 Because the phases are separate, you can re-render the same recorded episode
 with different visual settings without re-running any physics.
 
 Usage:
-    from tools.render import record_episode, render_to_gif
+    from tools.render import record_episode, render_video, render_to_gif
 
     frames = record_episode(env, policy, n_steps=250)
-    render_to_gif(frames, "outputs/rollout.gif", config, fps=20, every=2)
+    render_video(frames, "outputs/rollout.mp4", config, fps=8, every=1)
 
     python -m tools.render
     # 100-episode rollouts of the trained policy and the scripted controller,
-    # ranked, top wins as GIFs
+    # ranked, top 6 wins as MP4
 """
 import math
 import os
@@ -31,7 +31,8 @@ import matplotlib
 matplotlib.use("Agg")           # headless backend -- no display needed
 import matplotlib.pyplot as plt
 from matplotlib.colors import to_rgba
-from matplotlib.patches import Circle, Rectangle
+from matplotlib.patches import Circle, FancyBboxPatch, Rectangle
+from matplotlib.patheffects import withStroke
 import numpy as np
 import imageio.v2 as imageio
 import torch
@@ -39,16 +40,33 @@ import torch
 
 # ---------------------------------------------------------------- colors
 
-COLOR_AGENT = "#2a78d6"          # blue
-COLOR_AGENT_HURT = "#ff2020"     # bright red flash on damage
-COLOR_PREDATOR = "#d62728"       # red
-COLOR_PAYLOAD = "#ff8c1a"        # orange
-COLOR_PAYLOAD_SUCCESS = "#2ca02c"  # green flash on reaching goal
-COLOR_GOAL = "#2ca02c"           # green, drawn hollow so the payload stays visible
-COLOR_WALL = "#888888"           # grey
-COLOR_OBSTACLE = "#666666"
-COLOR_HEALTH_OK = "#4caf50"
-COLOR_HEALTH_LOW = "#d62728"
+COLOR_FLOOR = "#1a1d23"
+COLOR_WALL = "#2c313a"
+COLOR_OBSTACLE = "#3a404c"
+COLOR_SHADOW = "#0d0f12"
+COLOR_AGENT = "#3d8bfd"
+COLOR_AGENT_PUSH = "#7ec8ff"
+COLOR_AGENT_HURT = "#ff3b3b"
+COLOR_PREDATOR = "#e03131"
+COLOR_PREDATOR_COOL = "#8a4a4a"
+COLOR_PAYLOAD = "#f59e0b"
+COLOR_PAYLOAD_SUCCESS = "#22c55e"
+COLOR_GOAL_EDGE = "#14532d"
+COLOR_GOAL_FILL = "#22c55e"
+COLOR_LOCKON = "#f87171"
+COLOR_HUNTED = "#fde68a"
+COLOR_TEXT = "#e8eaed"
+COLOR_HEALTH_OK = "#22c55e"
+COLOR_HEALTH_MID = "#eab308"
+COLOR_HEALTH_LOW = "#ef4444"
+COLOR_HEALTH_TRACK = "#12151a"
+COLOR_HEALTH_BORDER = "#6b7280"
+
+# world-unit offset for the 2.5D drop shadow
+SHADOW_DX = 0.08
+SHADOW_DY = -0.08
+# velocity ticks: world units per (sim unit / sec). At speed 8 the tick is 0.4.
+VEL_TICK_SCALE = 0.05
 
 # backtrack only counts as "near the goal" once closest approach is inside this
 # many success radii. Early wobble is already in max_backtrack; this term is
@@ -70,7 +88,9 @@ class Frame:
     at the same final values.
     """
     agent_pos: torch.Tensor        # (E, n_agents, 2)
+    agent_vel: torch.Tensor        # (E, n_agents, 2)
     predator_pos: torch.Tensor     # (E, 2)
+    predator_vel: torch.Tensor     # (E, 2)
     payload_pos: torch.Tensor      # (E, 2)
     goal_pos: torch.Tensor         # (E, 2)
     obstacle_center: torch.Tensor  # (E, n_obstacles, 2)
@@ -83,6 +103,9 @@ class Frame:
     truncated: torch.Tensor       # (E,) bool -- hit max_steps, this step
     win_count: torch.Tensor        # (E,) running total, carried forward every frame
     loss_count: torch.Tensor       # (E,) running total, carried forward every frame
+    predator_target: torch.Tensor  # (E,) long -- lock-on agent index
+    predator_cooldown: torch.Tensor  # (E,) steps remaining
+    behind_mask: torch.Tensor      # (E, n_agents) bool -- push-zone, same as trainer
 
 
 @dataclass
@@ -119,10 +142,14 @@ class EpisodeRecord:
 
 
 def _capture_frame(ws, ss, health_before, at_goal, terminated, truncated,
-                   win_count, loss_count):
+                   win_count, loss_count, config):
+    from env import scenario
+    behind_mask, _ = scenario.payload_side_masks(ws, ss, config.push_zone_radius)
     return Frame(
         agent_pos=ws.agent_pos.clone(),
+        agent_vel=ws.agent_vel.clone(),
         predator_pos=ws.predator_pos.clone(),
+        predator_vel=ws.predator_vel.clone(),
         payload_pos=ws.payload_pos.clone(),
         goal_pos=ss.goal_pos.clone(),
         obstacle_center=ws.obstacle_center.clone(),
@@ -135,6 +162,9 @@ def _capture_frame(ws, ss, health_before, at_goal, terminated, truncated,
         truncated=truncated.clone(),
         win_count=win_count.clone(),
         loss_count=loss_count.clone(),
+        predator_target=ss.predator_target.clone(),
+        predator_cooldown=ss.predator_cooldown.clone(),
+        behind_mask=behind_mask.clone(),
     )
 
 
@@ -173,7 +203,7 @@ def record_episode(env, policy, n_steps, training_progress=1.0):
 
         frames.append(_capture_frame(
             ws, ss, health_before, at_goal, terminated, truncated,
-            win_count, loss_count))
+            win_count, loss_count, env.config))
 
     print(f"closest approach per env (threshold={env.config.success_threshold}):")
     for e in range(E):
@@ -416,7 +446,7 @@ def record_episodes(env, policy, n_episodes, training_progress=1.0):
 
     Metrics are accumulated live (forces, side masks, evasion) so ranking does
     not have to reconstruct them from positions after the fact. Frames are
-    kept per episode so a later select can stitch a GIF without re-simulating.
+    kept per episode so a later select can stitch a demo without re-simulating.
     """
     from env import scenario
 
@@ -459,7 +489,7 @@ def record_episodes(env, policy, n_episodes, training_progress=1.0):
 
         accum.frames.append(_capture_frame(
             ws, ss, health_before, at_goal, terminated, truncated,
-            win_count, loss_count))
+            win_count, loss_count, config))
 
         if won_now or captured_now or timed_out_now:
             n_steps = int(ss.step_count[e])
@@ -508,6 +538,14 @@ def compute_arena_limit(config, margin=1.15):
     return max_extent * margin
 
 
+def _health_color(frac):
+    if frac < 0.3:
+        return COLOR_HEALTH_LOW
+    if frac < 0.55:
+        return COLOR_HEALTH_MID
+    return COLOR_HEALTH_OK
+
+
 class _PanelArtists:
     """Holds the matplotlib patch objects for one panel.
 
@@ -527,6 +565,9 @@ class _PanelArtists:
         ax.set_aspect("equal")
         ax.set_xticks([])
         ax.set_yticks([])
+        ax.set_facecolor(COLOR_FLOOR)
+        for spine in ax.spines.values():
+            spine.set_visible(False)
 
         self.show_diagnostics = show_diagnostics
         self.show_tally = show_tally
@@ -534,9 +575,10 @@ class _PanelArtists:
         self.use_payload_trail = payload_trail
         self.body_trail_len = body_trail_len
         self.n_agents = n_agents
+        self.agent_radius = config.agent_radius
         self._last_step = None
+        self._label_stroke = [withStroke(linewidth=2.4, foreground="#111111")]
 
-        # walls never move -- draw once, never touch again
         for wc, wh in zip(config.wall_center, config.wall_halfsize):
             ax.add_patch(Rectangle(
                 (float(wc[0] - wh[0]), float(wc[1] - wh[1])),
@@ -545,25 +587,27 @@ class _PanelArtists:
             ))
 
         oh = config.obstacle_halfsize
+        self.obstacle_shadows = []
         self.obstacles = []
         for i in range(n_obstacles):
             hw = float(oh[i][0]) if oh.dim() > 1 else float(oh[0])
             hh = float(oh[i][1]) if oh.dim() > 1 else float(oh[1])
+            self.obstacle_halfsize = (hw, hh)
+            shadow = Rectangle((0, 0), 2 * hw, 2 * hh,
+                               facecolor=COLOR_SHADOW, edgecolor="none",
+                               alpha=0.55, zorder=5.3)
             patch = Rectangle((0, 0), 2 * hw, 2 * hh,
                                facecolor=COLOR_OBSTACLE, edgecolor="none", zorder=5.5)
-            self.obstacle_halfsize = (hw, hh)
+            ax.add_patch(shadow)
             ax.add_patch(patch)
+            self.obstacle_shadows.append(shadow)
             self.obstacles.append(patch)
 
-        if filled_goal:
-            self.goal = Circle(
-                (0, 0), config.success_threshold,
-                facecolor=to_rgba(COLOR_GOAL, 0.18),
-                edgecolor=COLOR_GOAL, linestyle=":", linewidth=2.2, zorder=3)
-        else:
-            # hollow + dashed so the payload stays visible once it moves inside
-            self.goal = Circle((0, 0), config.success_threshold, facecolor="none",
-                                edgecolor=COLOR_GOAL, linestyle="--", linewidth=2, zorder=3)
+        goal_fill = to_rgba(COLOR_GOAL_FILL, 0.16) if filled_goal else "none"
+        self.goal = Circle(
+            (0, 0), config.success_threshold,
+            facecolor=goal_fill, edgecolor=COLOR_GOAL_EDGE,
+            linestyle="solid", linewidth=2.6, zorder=3)
         ax.add_patch(self.goal)
 
         self.payload_xs = []
@@ -586,55 +630,92 @@ class _PanelArtists:
             solid_capstyle="round")
         self.predator_trail.set_visible(body_trail_len > 0)
 
+        self.lockon, = ax.plot(
+            [], [], color=COLOR_LOCKON, lw=1.2, alpha=0.85, zorder=5.8,
+            solid_capstyle="round")
+
         ph = config.payload_halfsize
         self.payload_halfsize = (float(ph[0]), float(ph[1]))
+        self.payload_shadow = Rectangle(
+            (0, 0), 2 * self.payload_halfsize[0], 2 * self.payload_halfsize[1],
+            facecolor=COLOR_SHADOW, edgecolor="none", alpha=0.55, zorder=4.8)
         self.payload = Rectangle((0, 0), 2 * self.payload_halfsize[0],
                                    2 * self.payload_halfsize[1],
                                    facecolor=COLOR_PAYLOAD, edgecolor="none", zorder=5)
+        ax.add_patch(self.payload_shadow)
         ax.add_patch(self.payload)
 
-        self.agents = []
-        for _ in range(n_agents):
-            patch = Circle((0, 0), config.agent_radius, facecolor=COLOR_AGENT,
-                            edgecolor="none", zorder=6)
-            ax.add_patch(patch)
-            self.agents.append(patch)
-
-        self.predator = Circle((0, 0), config.predator_radius,
-                                facecolor=COLOR_PREDATOR, edgecolor="none", zorder=6)
-        ax.add_patch(self.predator)
-
-        # capture radius is larger than the body and is what actually drains
-        # health, so without drawing it the damage looks like it fires at range
-        self.capture = Circle((0, 0), config.predator_capture_radius, facecolor="none",
-                               edgecolor=COLOR_PREDATOR, linestyle=":", linewidth=1,
-                               alpha=0.6, zorder=4)
+        self.capture = Circle(
+            (0, 0), config.predator_capture_radius,
+            facecolor=to_rgba(COLOR_PREDATOR, 0.14),
+            edgecolor=to_rgba(COLOR_PREDATOR, 0.45),
+            linestyle="solid", linewidth=1.0, zorder=4)
         ax.add_patch(self.capture)
 
+        self.agent_shadows = []
+        self.agents = []
+        self.agent_labels = []
+        self.agent_ticks = []
+        for i in range(n_agents):
+            shadow = Circle((0, 0), config.agent_radius,
+                            facecolor=COLOR_SHADOW, edgecolor="none",
+                            alpha=0.55, zorder=5.6)
+            patch = Circle((0, 0), config.agent_radius, facecolor=COLOR_AGENT,
+                            edgecolor="#dbeafe", linewidth=0.6, zorder=6)
+            ax.add_patch(shadow)
+            ax.add_patch(patch)
+            self.agent_shadows.append(shadow)
+            self.agents.append(patch)
+            label = ax.text(
+                0, 0, str(i + 1), ha="center", va="center",
+                fontsize=6, color="white", weight="bold", zorder=7,
+                path_effects=self._label_stroke)
+            self.agent_labels.append(label)
+            tick, = ax.plot([], [], color="white", lw=1.3, alpha=0.85,
+                             zorder=6.5, solid_capstyle="round")
+            self.agent_ticks.append(tick)
+
+        self.hunted_ring = Circle(
+            (0, 0), config.agent_radius * 1.55,
+            facecolor="none", edgecolor=COLOR_HUNTED, linewidth=1.6, zorder=6.2)
+        ax.add_patch(self.hunted_ring)
+
+        self.predator_shadow = Circle(
+            (0, 0), config.predator_radius,
+            facecolor=COLOR_SHADOW, edgecolor="none", alpha=0.55, zorder=5.6)
+        self.predator = Circle((0, 0), config.predator_radius,
+                                facecolor=COLOR_PREDATOR, edgecolor="#fecaca",
+                                linewidth=0.7, zorder=6)
+        ax.add_patch(self.predator_shadow)
+        ax.add_patch(self.predator)
+        self.predator_tick, = ax.plot(
+            [], [], color="white", lw=1.4, alpha=0.85, zorder=6.5,
+            solid_capstyle="round")
+
         self.text = ax.text(0.02, 0.98, "", transform=ax.transAxes,
-                             va="top", ha="left", fontsize=7, family="monospace")
+                             va="top", ha="left", fontsize=7, family="monospace",
+                             color=COLOR_TEXT)
         self.text.set_visible(show_diagnostics)
 
-        # persistent tally, always visible, separate from the transient outcome banner
         self.tally = ax.text(0.02, 0.02, "", transform=ax.transAxes,
                               va="bottom", ha="left", fontsize=8, family="monospace",
-                              weight="bold")
+                              weight="bold", color=COLOR_TEXT)
         self.tally.set_visible(show_tally)
 
-        # a light veil over the whole panel so WIN / CAPTURED / TIMEOUT read
-        # even when the last-frame motion is busy. Hidden until an episode ends.
         self.outcome_veil = Rectangle(
             (0.0, 0.0), 1.0, 1.0, transform=ax.transAxes,
-            facecolor="white", edgecolor="none", alpha=0.0, zorder=19, visible=False)
+            facecolor=COLOR_FLOOR, edgecolor="none", alpha=0.0, zorder=19, visible=False)
         ax.add_patch(self.outcome_veil)
 
         if prominent_banner:
             banner_xy, banner_w, banner_h, banner_fs = (0.10, 0.34), 0.80, 0.32, 28
         else:
             banner_xy, banner_w, banner_h, banner_fs = (0.10, 0.40), 0.80, 0.20, 16
-        self.banner_bg = Rectangle(
+        self.banner_bg = FancyBboxPatch(
             banner_xy, banner_w, banner_h, transform=ax.transAxes,
-            facecolor="white", edgecolor="black", linewidth=2.0 if prominent_banner else 1.5,
+            boxstyle="round,pad=0.01,rounding_size=0.02",
+            facecolor="#1f2937", edgecolor="#9ca3af",
+            linewidth=2.0 if prominent_banner else 1.5,
             alpha=0.94, zorder=20, visible=False)
         ax.add_patch(self.banner_bg)
         self.banner_text = ax.text(0.5, banner_xy[1] + banner_h / 2, "",
@@ -643,21 +724,27 @@ class _PanelArtists:
                                      weight="bold", zorder=21, visible=False)
         self.prominent_banner = prominent_banner
 
-        # health bar: a grey background track with a colored fill on top.
-        # transform=ax.transAxes puts these in panel-relative coordinates
-        # (0-1) rather than world coordinates, so they stay pinned to the
-        # corner regardless of what the simulation is doing.
-        bar_x, bar_y, bar_w, bar_h = 0.62, 0.94, 0.35, 0.03
-        ax.add_patch(Rectangle((bar_x, bar_y), bar_w, bar_h, transform=ax.transAxes,
-                                facecolor="#dddddd", edgecolor="none", zorder=10))
-        self.health_bar = Rectangle((bar_x, bar_y), bar_w, bar_h, transform=ax.transAxes,
-                                      facecolor=COLOR_HEALTH_OK, edgecolor="none", zorder=11)
-        self.health_bar_width = bar_w
+        bar_x, bar_y, bar_w, bar_h = 0.56, 0.93, 0.40, 0.042
+        pad = 0.006
+        ax.add_patch(FancyBboxPatch(
+            (bar_x, bar_y), bar_w, bar_h, transform=ax.transAxes,
+            boxstyle="round,pad=0.003,rounding_size=0.012",
+            facecolor=COLOR_HEALTH_TRACK, edgecolor=COLOR_HEALTH_BORDER,
+            linewidth=1.2, zorder=10))
+        inner_x = bar_x + pad
+        inner_y = bar_y + pad
+        inner_w = bar_w - 2 * pad
+        inner_h = bar_h - 2 * pad
+        self.health_bar = Rectangle(
+            (inner_x, inner_y), inner_w, inner_h, transform=ax.transAxes,
+            facecolor=COLOR_HEALTH_OK, edgecolor="none", zorder=11)
+        self.health_bar_x = inner_x
+        self.health_bar_width = inner_w
         ax.add_patch(self.health_bar)
         self.health_label = ax.text(
-            bar_x - 0.02, bar_y + bar_h / 2, "", transform=ax.transAxes,
-            va="center", ha="right", fontsize=9, family="monospace",
-            weight="bold", zorder=12)
+            bar_x - 0.018, bar_y + bar_h / 2, "", transform=ax.transAxes,
+            va="center", ha="right", fontsize=8, family="sans-serif",
+            weight="bold", color=COLOR_TEXT, zorder=12)
         self.health_label.set_visible(show_health_value)
 
     def _reset_trails(self):
@@ -673,12 +760,15 @@ class _PanelArtists:
     def update(self, frame, e, config):
         for i, patch in enumerate(self.obstacles):
             if bool(frame.obstacle_active[e, i]):
-                cx, cy = frame.obstacle_center[e, i]
-                patch.set_xy((float(cx) - self.obstacle_halfsize[0],
-                               float(cy) - self.obstacle_halfsize[1]))
+                cx, cy = float(frame.obstacle_center[e, i][0]), float(frame.obstacle_center[e, i][1])
+                xy = (cx - self.obstacle_halfsize[0], cy - self.obstacle_halfsize[1])
+                patch.set_xy(xy)
                 patch.set_visible(True)
+                self.obstacle_shadows[i].set_xy((xy[0] + SHADOW_DX, xy[1] + SHADOW_DY))
+                self.obstacle_shadows[i].set_visible(True)
             else:
                 patch.set_visible(False)
+                self.obstacle_shadows[i].set_visible(False)
 
         gx, gy = frame.goal_pos[e]
         self.goal.center = (float(gx), float(gy))
@@ -686,21 +776,55 @@ class _PanelArtists:
         px, py = float(frame.payload_pos[e][0]), float(frame.payload_pos[e][1])
         self.payload.set_xy((px - self.payload_halfsize[0],
                               py - self.payload_halfsize[1]))
+        self.payload_shadow.set_xy((
+            px - self.payload_halfsize[0] + SHADOW_DX,
+            py - self.payload_halfsize[1] + SHADOW_DY))
         self.payload.set_facecolor(
             COLOR_PAYLOAD_SUCCESS if bool(frame.at_goal[e]) else COLOR_PAYLOAD
         )
 
         hurt = bool(frame.took_damage[e])
+        target = int(frame.predator_target[e])
+        behind = frame.behind_mask[e]
         agent_xy = []
         for i, patch in enumerate(self.agents):
             ax_, ay_ = float(frame.agent_pos[e, i][0]), float(frame.agent_pos[e, i][1])
             patch.center = (ax_, ay_)
-            patch.set_facecolor(COLOR_AGENT_HURT if hurt else COLOR_AGENT)
+            self.agent_shadows[i].center = (ax_ + SHADOW_DX, ay_ + SHADOW_DY)
+            if hurt:
+                color = COLOR_AGENT_HURT
+            elif bool(behind[i]):
+                color = COLOR_AGENT_PUSH
+            else:
+                color = COLOR_AGENT
+            patch.set_facecolor(color)
+            self.agent_labels[i].set_position((ax_, ay_ + self.agent_radius * 2.4))
+            vx = float(frame.agent_vel[e, i, 0])
+            vy = float(frame.agent_vel[e, i, 1])
+            self.agent_ticks[i].set_data(
+                [ax_, ax_ + vx * VEL_TICK_SCALE],
+                [ay_, ay_ + vy * VEL_TICK_SCALE])
             agent_xy.append((ax_, ay_))
+
+        tx, ty = agent_xy[target]
+        self.hunted_ring.center = (tx, ty)
 
         rx, ry = float(frame.predator_pos[e][0]), float(frame.predator_pos[e][1])
         self.predator.center = (rx, ry)
+        self.predator_shadow.center = (rx + SHADOW_DX, ry + SHADOW_DY)
         self.capture.center = (rx, ry)
+        self.lockon.set_data([rx, tx], [ry, ty])
+        if float(frame.predator_cooldown[e]) > 0.0:
+            self.predator.set_facecolor(COLOR_PREDATOR_COOL)
+            self.predator.set_alpha(0.7)
+        else:
+            self.predator.set_facecolor(COLOR_PREDATOR)
+            self.predator.set_alpha(1.0)
+        pvx = float(frame.predator_vel[e, 0])
+        pvy = float(frame.predator_vel[e, 1])
+        self.predator_tick.set_data(
+            [rx, rx + pvx * VEL_TICK_SCALE],
+            [ry, ry + pvy * VEL_TICK_SCALE])
 
         step = int(frame.step_count[e])
         if self._last_step is not None and step < self._last_step:
@@ -726,6 +850,8 @@ class _PanelArtists:
 
         health = float(frame.health[e])
         max_health = config.max_health
+        frac = max(health, 0.0) / max_health
+        hp_color = _health_color(frac)
 
         if self.show_diagnostics:
             dist = float(torch.norm(frame.payload_pos[e] - frame.goal_pos[e]))
@@ -736,15 +862,12 @@ class _PanelArtists:
                 f"dist   {dist:5.2f}"
             )
 
-        frac = max(health, 0.0) / max_health
         self.health_bar.set_width(self.health_bar_width * frac)
-        self.health_bar.set_facecolor(
-            COLOR_HEALTH_LOW if frac < 0.3 else COLOR_HEALTH_OK
-        )
+        self.health_bar.set_facecolor(hp_color)
+        self.health_bar.set_visible(frac > 0.0)
         if self.show_health_value:
-            self.health_label.set_text(f"{health:.0f}/{max_health:.0f}")
-            self.health_label.set_color(
-                COLOR_HEALTH_LOW if frac < 0.3 else COLOR_HEALTH_OK)
+            self.health_label.set_text(f"HP  {health:.0f}")
+            self.health_label.set_color(hp_color)
 
         if self.show_tally:
             wins = int(frame.win_count[e])
@@ -752,7 +875,7 @@ class _PanelArtists:
             self.tally.set_text(f"W {wins}  L {losses}")
 
         # outcome banner: only visible on the exact frame(s) an episode ended.
-        # Since render_to_gif redraws this SAME frame repeatedly during a
+        # Since render_video redraws this SAME frame repeatedly during a
         # hold, the banner naturally persists for the hold's duration with
         # no separate timer needed here.
         won = bool(frame.terminated[e] and frame.at_goal[e])
@@ -766,24 +889,24 @@ class _PanelArtists:
             if won:
                 veil = to_rgba(COLOR_PAYLOAD_SUCCESS, 0.22 if self.prominent_banner else 0.10)
                 self.outcome_veil.set_facecolor(veil)
-                self.banner_bg.set_facecolor("#b7efb7")
-                self.banner_bg.set_edgecolor(COLOR_PAYLOAD_SUCCESS)
+                self.banner_bg.set_facecolor("#14532d")
+                self.banner_bg.set_edgecolor(COLOR_GOAL_EDGE)
                 self.banner_text.set_text("WIN")
-                self.banner_text.set_color(COLOR_PAYLOAD_SUCCESS)
+                self.banner_text.set_color("#86efac")
             elif captured:
                 veil = to_rgba(COLOR_PREDATOR, 0.22 if self.prominent_banner else 0.10)
                 self.outcome_veil.set_facecolor(veil)
-                self.banner_bg.set_facecolor("#f5b5b5")
+                self.banner_bg.set_facecolor("#7f1d1d")
                 self.banner_bg.set_edgecolor(COLOR_PREDATOR)
                 self.banner_text.set_text("CAPTURED")
-                self.banner_text.set_color(COLOR_PREDATOR)
+                self.banner_text.set_color("#fca5a5")
             else:
-                veil = to_rgba("#555555", 0.18 if self.prominent_banner else 0.08)
+                veil = to_rgba("#6b7280", 0.22 if self.prominent_banner else 0.10)
                 self.outcome_veil.set_facecolor(veil)
-                self.banner_bg.set_facecolor("#e4e4e4")
-                self.banner_bg.set_edgecolor("#555555")
+                self.banner_bg.set_facecolor("#374151")
+                self.banner_bg.set_edgecolor("#9ca3af")
                 self.banner_text.set_text("TIMEOUT")
-                self.banner_text.set_color("#555555")
+                self.banner_text.set_color("#d1d5db")
         else:
             self.outcome_veil.set_visible(False)
             self.banner_bg.set_visible(False)
@@ -827,11 +950,29 @@ def _build_panel_schedule(frames, panel_idx, every, hold_frames):
     return schedule
 
 
-def render_to_gif(frames, output_path, config, fps=20, every=1, n_panels=4,
-                  hold_seconds=1.5, arena_margin=1.15, show_diagnostics=True,
-                  show_tally=True, show_health_value=False, payload_trail=False,
-                  body_trail_len=0, filled_goal=False, prominent_banner=False):
-    """Draw recorded frames and write an animated GIF.
+def _write_video(output_path, images, fps):
+    """Encode RGB frames. MP4 uses H.264/yuv420p for GitHub/browser playback."""
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    ext = os.path.splitext(output_path)[1].lower()
+    if ext in (".mp4", ".m4v", ".mov"):
+        h, w = images[0].shape[:2]
+        if w % 2 or h % 2:
+            images = [img[:h - (h % 2), :w - (w % 2)] for img in images]
+        imageio.mimsave(
+            output_path, images, fps=fps, codec="libx264",
+            pixelformat="yuv420p", macro_block_size=1, quality=8)
+    else:
+        # loop=0 writes the Netscape 2.0 extension (infinite loop). Without it
+        # GitHub and most markdown previews show the GIF as a still first frame.
+        imageio.mimsave(output_path, images, fps=fps, loop=0)
+    return output_path
+
+
+def render_video(frames, output_path, config, fps=20, every=1, n_panels=4,
+                 hold_seconds=1.5, arena_margin=1.15, show_diagnostics=True,
+                 show_tally=True, show_health_value=False, payload_trail=False,
+                 body_trail_len=0, filled_goal=False, prominent_banner=False):
+    """Draw recorded frames and write GIF or MP4 (codec from the file suffix).
 
     `every` skips frames at DRAW time, not record time -- so you can render
     a quick low-frame-count version and a detailed one from the same
@@ -839,7 +980,7 @@ def render_to_gif(frames, output_path, config, fps=20, every=1, n_panels=4,
 
     `hold_seconds` controls how long each panel pauses on its outcome banner
     once an episode ends -- converted to a frame count using `fps`, since a
-    GIF has no independent notion of "pause," only "show this frame longer."
+    video file has no independent notion of "pause," only "show this frame longer."
     """
     if not frames:
         raise ValueError("no frames to render")
@@ -852,12 +993,15 @@ def render_to_gif(frames, output_path, config, fps=20, every=1, n_panels=4,
 
     if n_panels == 1:
         fig, ax = plt.subplots(1, 1, figsize=(6.4, 6.4), dpi=100)
+        fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
         axes = [ax]
     else:
         fig, axes = plt.subplots(2, 2, figsize=(8, 8), dpi=80)
         axes = axes.flatten()
         for ax in axes[n_panels:]:
             ax.set_visible(False)
+        fig.tight_layout()
+    fig.patch.set_facecolor(COLOR_FLOOR)
 
     artists = [_PanelArtists(
         axes[e], config, n_agents, n_obstacles,
@@ -870,7 +1014,6 @@ def render_to_gif(frames, output_path, config, fps=20, every=1, n_panels=4,
         filled_goal=filled_goal,
         prominent_banner=prominent_banner,
     ) for e in range(n_panels)]
-    fig.tight_layout()
 
     # one schedule per panel, since panels can hold at different points and
     # for different total durations depending on when each one's episodes end
@@ -893,16 +1036,16 @@ def render_to_gif(frames, output_path, config, fps=20, every=1, n_panels=4,
         images.append(buf[:, :, :3].copy())
 
     plt.close(fig)
+    return _write_video(output_path, images, fps)
 
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    # loop=0 writes the Netscape 2.0 extension (infinite loop). Without it
-    # GitHub and most markdown previews show the GIF as a still first frame.
-    imageio.mimsave(output_path, images, fps=fps, loop=0)
-    return output_path
+
+def render_to_gif(*args, **kwargs):
+    """Backward-compatible alias used by tools.render_seeds."""
+    return render_video(*args, **kwargs)
 
 
 DEMO_RENDER_KWARGS = dict(
-    fps=10, every=2, n_panels=1, hold_seconds=3.5,
+    fps=16, every=2, n_panels=1, hold_seconds=1.5,
     arena_margin=1.02, show_diagnostics=False, show_tally=False,
     show_health_value=True, payload_trail=True, body_trail_len=12,
     filled_goal=True, prominent_banner=True,
@@ -910,7 +1053,7 @@ DEMO_RENDER_KWARGS = dict(
 
 
 def render_policy_demo(env, policy, output_path, label, n_episodes=100, n_pick=6):
-    """Collect, rank, and write a single-panel demo GIF for any policy."""
+    """Collect, rank, and write a single-panel demo video for any policy."""
     print(f"recording {n_episodes} episodes ({label}) ...", flush=True)
     episodes = record_episodes(env, policy, n_episodes=n_episodes)
     n_wins = sum(1 for ep in episodes if ep.won)
@@ -931,7 +1074,7 @@ def render_policy_demo(env, policy, output_path, label, n_episodes=100, n_pick=6
               f"  hp={ep.end_health:.0f}  obsP={ep.max_obstacle_pen:.3f}")
 
     frames = [frame for ep in selected for frame in ep.frames]
-    path = render_to_gif(frames, output_path, env.config, **DEMO_RENDER_KWARGS)
+    path = render_video(frames, output_path, env.config, **DEMO_RENDER_KWARGS)
     print(f"wrote {path}")
     return path
 
@@ -964,8 +1107,8 @@ if __name__ == "__main__":
         return scripted_policy(scenario.observe(world_state, scenario_state, cfg), cfg)
 
     render_policy_demo(
-        Env(config), actor_policy, "outputs/actor_variant_c_400_seed_4_demo.gif",
+        Env(config), actor_policy, "outputs/actor_variant_c_400_seed_4_demo.mp4",
         label=CHECKPOINT, n_episodes=N_EPISODES, n_pick=N_PICK)
     render_policy_demo(
-        Env(config), scripted_wrapper, "outputs/scripted_demo.gif",
+        Env(config), scripted_wrapper, "outputs/scripted_demo.mp4",
         label="scripted", n_episodes=N_EPISODES, n_pick=N_PICK)
