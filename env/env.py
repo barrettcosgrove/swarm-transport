@@ -1,9 +1,5 @@
-from . import world
 from . import scenario
 from . import physics
-from train.config import Config
-from .world import WorldState
-from .scenario import ScenarioState
 import torch
 import dataclasses
 
@@ -11,7 +7,7 @@ import dataclasses
 1. predator_policy()          -> predator action + updated scenario state (noise saved)
 2. physics.step()             -> new world state
 3. scenario.update_health()   -> updated health + cooldown + prev_health saved
-4. scenario.compute_reward()  -> reward tensor
+4. scenario.reward_terms()    -> per-term tensors, summed locally into reward
 5. scenario.compute_done()    -> terminated, truncated
 6. scenario.observe()         -> the pre-reset observation, kept in info
 7. build the info dict from the pre-reset state

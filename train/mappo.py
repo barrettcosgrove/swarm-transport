@@ -28,24 +28,21 @@ import torch.nn.functional as F
 
 from env import scenario
 from env.env import Env
-from train.checkpoints import save_checkpoint, load_checkpoint
+from train.checkpoints import save_checkpoint, load_checkpoint, load_history
 from train.config import Config
 
 
 # ---------------------------------------------------------------- actor
 
 class Actor(nn.Module):
-    """The deployed policy: one agent's local observation in, action mean out.
+    """The policy: one agent's local observation in, action mean out.
 
-    Shared across agents, which is what makes a single ONNX file enough for a
-    whole team. nn.Linear maps over the last dimension only, so an
+    Shared across agents. nn.Linear maps over the last dimension only, so an
     (E, n_agents, obs_dim) batch flows through untouched -- there is no loop
     over agents anywhere in this file.
 
-    Deliberately never given access to the joint observation. Each agent runs
-    its own copy of this network in the browser with local perception only, so
-    global state in the actor's input is not a design preference, it is
-    undeployable.
+    Deliberately never given access to the joint observation. The actor is
+    local-only; the critic is the one that sees the team.
     """
 
     def __init__(self, obs_dim, action_dim, hidden_dim):
@@ -69,9 +66,9 @@ class Actor(nn.Module):
     def forward(self, obs):
         """Observation -> action mean. Nothing else.
 
-        Sampling and log_std stay out of here so torch.onnx.export traces
-        exactly the graph the browser needs. Putting the distribution in
-        forward would drag a sampler into the exported graph.
+        Sampling and log_std stay out of here so a deterministic rollout
+        (render, eval) is just forward plus a clamp. Putting the distribution
+        in forward would sample on every call.
         """
         return self.net(obs)
 
@@ -104,14 +101,14 @@ class Actor(nn.Module):
 # ---------------------------------------------------------------- critic
 
 class Critic(nn.Module):
-    """Centralized value function. Training-only, never exported.
+    """Centralized value function. Used only in training / GAE.
 
     Input is every agent's observation concatenated, plus a one-hot agent id.
     The one-hot is the only thing distinguishing the n_agents rows belonging to
     one environment: without it they are byte-identical, and a deterministic
     network would have to return the same value for all of them. That would be
-    wrong, because compute_reward gives each agent a private approach_reward
-    and collision_reward.
+    wrong, because compute_reward gives each agent private approach, push,
+    collision, threat and health-blame terms.
     """
 
     def __init__(self, obs_dim, n_agents, hidden_dim):
@@ -163,13 +160,12 @@ class Critic(nn.Module):
 class ValueNormalizer:
     """Running mean/std over value targets, for normalizing the critic's scale.
 
-    The reward table puts +/-100 terminal spikes next to -0.1--0.8 per-step
+    The reward table puts +/-450 terminal spikes next to -0.1-scale per-step
     terms. That dynamic range is the regime this exists for, and the MAPPO
     paper reports value normalization never hurts and often helps a lot.
 
-    Off by default (config.use_value_norm) so the first training run is the
-    simplest possible thing and a failure has one candidate cause. Flipping it
-    is then a clean one-variable experiment.
+    On by default (config.use_value_norm). Turning it off is the one-variable
+    experiment if value loss will not settle.
 
     Not an nn.Module: it holds statistics, not parameters, and giving it a
     state_dict is enough for checkpointing.
@@ -184,7 +180,7 @@ class ValueNormalizer:
     def update(self, returns):
         """Chan's parallel variance update -- exact, and batched.
 
-        Welford one sample at a time would mean a Python loop over 40,960
+        Welford one sample at a time would mean a Python loop over 81,920
         values an iteration.
         """
         batch = returns.detach().reshape(-1)
@@ -230,7 +226,7 @@ class RolloutBuffer:
     """Preallocated storage for one iteration of experience, plus GAE.
 
     Every tensor is allocated once at construction and overwritten in place
-    each iteration, so a 40,960-sample iteration does no allocation in the hot
+    each iteration, so a 81,920-sample iteration does no allocation in the hot
     loop.
     """
 
@@ -323,7 +319,7 @@ class RolloutBuffer:
 
         Advantages are normalized across the whole batch, all agents together.
         """
-        T, E, N = self.rollout_steps, self.num_envs, self.n_agents
+        N = self.n_agents
         state_dim = critic.state_dim
 
         with torch.no_grad():
@@ -724,7 +720,7 @@ class MAPPOTrainer:
         config.num_iterations. That distinction matters because num_iterations
         remains the denominator for training_progress and the learning-rate
         schedule, so a 30-iteration preview can represent iterations 1--30 of a
-        planned 250-iteration run rather than compressing the full schedule
+        planned 400-iteration run rather than compressing the full schedule
         into 30 iterations.
 
         Set anneal_lr=False for a constant-learning-rate experiment. Reward
@@ -816,17 +812,19 @@ class MAPPOTrainer:
                                self.config, self.value_normalizer, self.logger.history)
 
     def load(self, path, map_location=None):
-        return load_checkpoint(path, self.actor, self.critic,
-                               self.optimizer_actor, self.optimizer_critic,
-                               self.value_normalizer,
-                               map_location or self.config.device)
+        location = map_location or self.config.device
+        iteration = load_checkpoint(path, self.actor, self.critic,
+                                    self.optimizer_actor, self.optimizer_critic,
+                                    self.value_normalizer, location)
+        self.logger.history = load_history(path, location) or []
+        return iteration
 
     def save_periodic(self, iteration, final=False):
         """checkpoint_latest.pt every interval, numbered snapshots more rarely.
 
         Overwriting one latest file is what makes a frequent interval cheap;
         the numbered copies exist so a run that degrades late still has an
-        earlier policy to fall back on, without leaving 250 files on disk.
+        earlier policy to fall back on, without a file per iteration.
         """
         cfg = self.config
         paths = [os.path.join(cfg.checkpoint_dir, "checkpoint_latest.pt")]

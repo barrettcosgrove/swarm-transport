@@ -92,7 +92,7 @@ def _evasion(pred_off, rel_pos, config):
     a target that is no longer the nearest. That is the information the
     observation does not contain.
 
-    Agents out-run the predator (20 against a 6.0 speed cap), so fleeing works;
+    Agents out-run the predator (20 against a 3.5 speed cap), so fleeing works;
     the aim is only to survive contact, not win a chase.
     """
     dist = torch.norm(pred_off, dim=-1, keepdim=True)

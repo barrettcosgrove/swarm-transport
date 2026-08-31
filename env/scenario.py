@@ -533,8 +533,6 @@ def compute_reward(world_state, scenario_state, training_progress, config, actio
     return torch.stack(tuple(reward_terms(world_state, scenario_state, training_progress, config, actions=actions).values())).sum(0)
 
 def compute_done(world_state, scenario_state, config) -> tuple[torch.Tensor, torch.Tensor]:
-    E = world_state.agent_pos.shape[0]
-    
     curr_payload_dist = torch.norm(world_state.payload_pos - scenario_state.goal_pos, dim=-1)
     success = curr_payload_dist < config.success_threshold
     captured = (scenario_state.health).clone().detach() <= 0.0
@@ -544,7 +542,7 @@ def compute_done(world_state, scenario_state, config) -> tuple[torch.Tensor, tor
     
     return terminated, truncated
 
-def predator_policy(world_state, scenario_state, config, generator=None) -> (torch.Tensor, ScenarioState):  # (E, 2)   [Version 2]
+def predator_policy(world_state, scenario_state, config, generator=None) -> (torch.Tensor, ScenarioState):  # (E, 2)
     E = world_state.agent_pos.shape[0]
     
     dist_agent_to_predator = torch.norm(world_state.agent_pos - world_state.predator_pos.unsqueeze(1), dim=-1)
@@ -607,7 +605,7 @@ def effective_predator_max_speed(scenario_state, config) -> torch.Tensor:   # (E
 
 def update_health(world_state, scenario_state, config) -> ScenarioState: 
     """Drain a flat health_loss_per_step whenever any agent is inside the
-    predator's capture radius, per DESIGN.md section 7.
+    predator's capture radius, per DESIGN.md section 2.
 
     Deliberately not proportional to contact force. Penalty forces scale with
     penetration depth, and penetration depth is set by how far a body travels

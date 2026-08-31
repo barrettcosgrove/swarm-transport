@@ -6,17 +6,17 @@ class WorldState:
     agent_pos: torch.Tensor          # (E, n_agents, 2)
     agent_vel: torch.Tensor          # (E, n_agents, 2)
     agent_radius: torch.Tensor       # scalar or (n_agents,) -- homogeneous agents
-    agent_mass: torch.Tensor         # (E, n_agents, 1) -- corrected shape
+    agent_mass: torch.Tensor         # scalar, broadcasts against (E, n_agents, 2)
 
     predator_pos: torch.Tensor       # (E, 2)
     predator_vel: torch.Tensor       # (E, 2)
     predator_radius: torch.Tensor    # scalar
-    predator_mass: torch.Tensor      # (E, 1)
+    predator_mass: torch.Tensor      # scalar, broadcasts against (E, 2)
 
     payload_pos: torch.Tensor        # (E, 2)
     payload_vel: torch.Tensor        # (E, 2)
     payload_halfsize: torch.Tensor   # (2,)
-    payload_mass: torch.Tensor       # (E, 1)
+    payload_mass: torch.Tensor       # scalar, broadcasts against (E, 2)
 
     wall_center: torch.Tensor        # (n_walls, 2)     -- no E axis, same for every env
     wall_halfsize: torch.Tensor      # (n_walls, 2)

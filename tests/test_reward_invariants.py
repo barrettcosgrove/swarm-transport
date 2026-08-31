@@ -14,8 +14,10 @@ better than running out the clock, and the policy learned exactly that.
 
 Run with: pytest tests/test_reward_invariants.py -v
 """
+import pytest
 import torch
 
+from env.scenario import reset, reward_terms
 from train.config import Config
 
 
@@ -43,7 +45,7 @@ def survival_budget_steps(config):
 
 
 def test_dying_costs_more_than_running_out_the_clock():
-    """DESIGN.md section 11: max_steps * |R_time| < |R_capture|.
+    """DESIGN.md section 3: max_steps * |R_time| < |R_capture|.
 
     Violate this and suicide is not a quirk of exploration, it is the correct
     play for any policy that cannot reliably reach the goal -- and every policy
@@ -107,28 +109,19 @@ def test_episode_is_long_enough_to_finish():
     )
 
 
-def test_shaping_coefficients_anneal_to_zero():
-    """coef = start * (1 - min(progress / fraction, 1)), so a fraction above 1.0
-    never reaches zero and leaves a floor of start * (1 - 1/fraction).
-
-    Both fractions sat at 5.0, which pinned an 8.0 coefficient at 6.4 forever.
-    Approach is an exploration crutch that pulls agents onto the standoff
-    point behind the payload. 0.0 is a legal sentinel meaning "do not anneal"
-    (the 250-run that kept it on taught return-to-the-box). A value in (0, 1]
-    still completes; anything above 1.0 is the old floor bug. Push is not
-    annealed: it is the term that pays during sustained contact.
+def test_approach_stays_constant():
+    """0.0 is a sentinel: reward_terms keeps approach_coef at start for the
+    whole run. A decaying schedule taught flee-and-stay-gone. Alignment is
+    not a reward term -- that job is push_coef.
     """
     config = Config()
     assert config.approach_anneal_fraction == 0.0, (
         "approach_anneal_fraction is the constant-coefficient sentinel; "
         f"got {config.approach_anneal_fraction}"
     )
-    fraction = config.alignment_anneal_fraction
-    assert 0.0 < fraction <= 1.0, (
-        f"alignment_anneal_fraction={fraction} never completes: the "
-        f"coefficient bottoms out at {100 * (1 - 1 / fraction):.0f}% of "
-        f"its starting value"
-    )
+    world_state, scenario_state = reset(
+        1, Config(num_envs=1), torch.Generator().manual_seed(0))
+    assert "alignment" not in reward_terms(world_state, scenario_state, 0.0, config)
 
 
 def test_blame_fraction_is_a_fraction():
@@ -199,15 +192,18 @@ def test_threat_zone_leaves_room_to_push():
 
 
 # Fraction of agent-steps with nonzero closing-rate threat, measured by
-# tools/threat_calibrate.py against variant D at radius 3.0. Re-measure
-# whenever danger_radius or predator_max_speed change. This is a pessimistic
-# envelope -- most live steps pay a fraction of threat_coef -- so the
-# integral is an upper bound, not the realized episode sum.
+# tools/threat_calibrate.py against variant D at radius 3.0. Production is
+# radius 2.5, so this is a pessimistic envelope -- a wider field, and most
+# live steps pay a fraction of threat_coef. Re-measure if danger_radius
+# grows or predator_max_speed changes. The integral is an upper bound, not
+# the realized episode sum.
 MEASURED_THREAT_DUTY = 0.3855
 
 # Fraction of agent-steps with nonzero camping term, measured by
-# tools/threat_calibrate.py against variant D at camp_radius 0.8. Re-measure
-# whenever predator_camp_radius changes.
+# tools/threat_calibrate.py against variant D at camp_radius 0.8. Unused
+# while camp_coef is 0; kept so the gated integral below has a duty if
+# the term is turned back on. Re-measure whenever predator_camp_radius
+# changes.
 MEASURED_CAMP_DUTY = 0.4089
 
 
@@ -247,12 +243,20 @@ def test_camp_radius_is_tighter_than_the_danger_ring():
     )
 
 
+def test_camp_coef_is_off():
+    """Variant E cannot both spare the pushers and evict a hunter on the
+    crate. The term stays in reward_terms so the log key does not vanish.
+    """
+    assert Config().camp_coef == 0.0
+
+
 def test_camp_integral_stays_well_under_winning():
-    """Same envelope as threat. A 3.0 ungated field at threat_coef 1.0 is
-    how variant B summed to -138. Camping is always-on, so the duty is the
-    whole story -- it cannot hide behind a closing gate.
+    """Same envelope as threat. Vacuous while camp_coef is 0; the bound
+    matters the moment someone turns it back on.
     """
     config = Config()
+    if config.camp_coef <= 0.0:
+        pytest.skip("camp_coef is off; integral is tautological")
     budget = config.max_steps * config.camp_coef * MEASURED_CAMP_DUTY
     assert budget < config.success_reward, (
         f"camp integral {budget:.1f} against success {config.success_reward}. "
@@ -269,11 +273,13 @@ def test_flee_coef_is_off():
 
 
 def test_flee_integral_stays_well_under_winning():
-    """Only the hunted agent is paid, peak flee_coef per step. If that
-    envelope reached a win, fleeing forever would beat delivering the
-    crate -- variant B with the sign flipped.
+    """Only the hunted agent is paid, peak flee_coef per step. Vacuous
+    while flee_coef is 0; if the envelope reached a win, fleeing forever
+    would beat delivering the crate.
     """
     config = Config()
+    if config.flee_coef <= 0.0:
+        pytest.skip("flee_coef is off; integral is tautological")
     budget = config.max_steps * config.flee_coef / config.n_agents
     assert budget < config.success_reward, (
         f"flee envelope {budget:.1f} against success {config.success_reward}. "

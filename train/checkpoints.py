@@ -4,7 +4,7 @@ train/checkpoints.py
 Save and load training state as plain functions, with no dependency on
 MAPPOTrainer.
 
-Kept separate for the consumers: export_onnx.py and render.py want weights and
+Kept separate for the consumers: render.py and evaluate.py want weights and
 nothing else, and constructing a trainer to get them would mean building an
 environment, two optimizers and a rollout buffer just to read tensors off disk.
 MAPPOTrainer calls into here periodically; the direction of the dependency
@@ -57,7 +57,7 @@ def load_checkpoint(path, actor, critic, optimizer_actor=None, optimizer_critic=
     """Restore into already-constructed modules and return the iteration reached.
 
     map_location defaults to cpu so a GPU-trained checkpoint loads on a laptop
-    for rendering or ONNX export. Optimizers and the normalizer are optional:
+    for rendering or eval. Optimizers and the normalizer are optional:
     the weights-only consumers pass neither.
     """
     payload = torch.load(path, map_location=map_location)

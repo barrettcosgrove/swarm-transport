@@ -105,7 +105,7 @@ class Config:
     ou_decay: float = 0.95
     ou_sigma: float = 0.1
 
-    # spawn geometry (to be calibrated in Phase 2)
+    # spawn geometry
     payload_jitter_radius: float = 0.6
     r_agent_min: float = 1.2
     r_agent_max: float = 2.4
@@ -203,11 +203,6 @@ class Config:
     # zone the credited share is zero -- drift no agent caused is not blamed
     # on anyone.
     progress_blame_fraction: float = 0.7
-    # Kept so the anneal invariant still has something to check, but no longer
-    # consumed by compute_reward: a telescoping cosine summed to ~0 over a run
-    # and could not teach a standing push. That job is push_coef above.
-    alignment_coef_start: float = 8.0
-    alignment_anneal_fraction: float = 0.6
     health_loss_coef: float = 1.0
     # How much of a damage event is billed to the agents actually inside
     # predator_capture_radius, with the remainder still shared by the team.
@@ -231,7 +226,7 @@ class Config:
     # Deep enough that dying beats neither winning nor waiting: against the
     # inequality above it has to exceed max_steps * time_penalty_coef = 90, and
     # against a full health drain (-150) it is the worse outcome, which is the
-    # ordering DESIGN.md section 11 asks for.
+    # ordering DESIGN.md section 3 asks for.
     captured_reward: float = -250.0
     collision_coef: float = 0.002
     # A private "you are about to be hit" penalty, and the one signal an
@@ -303,9 +298,9 @@ class Config:
     num_iterations: int = 400
     lr: float = 3e-4
     max_grad_norm: float = 0.5
-    # Off for the first run so a failure has one candidate cause. The +/-100
-    # terminal spikes next to -0.1--0.8 per-step terms are exactly the regime
-    # value normalization exists for, so this is the first thing to flip.
+    # On because the +/-450 terminals next to -0.1-scale steps are the regime
+    # value normalization exists for. Turning it off is the one-variable
+    # experiment if value loss will not settle.
     use_value_norm: bool = True
 
     # network
@@ -316,7 +311,7 @@ class Config:
     checkpoint_dir: str = "train/checkpoints"
     log_path: str = "outputs/training_history.json"
     # Periodic blocking eval for checkpoint_best.pt. 0 disables it. 100 is
-    # 4 * checkpoint_interval, so a 250-run evals three times including the end.
+    # 4 * checkpoint_interval, so a 400-run evals four times including the end.
     eval_interval: int = 100
     eval_num_envs: int = 16
     
@@ -352,8 +347,8 @@ class Config:
         first forward pass.
 
         own pos/vel (4), goal offset (2), payload offset/rel vel (4),
-        predator offset/rel vel (4), time remaining (1), shared health (1),
-        plus offset + rel vel for each teammate (4 each). Cooldown is
+        teammate offset + rel vel (4 each), time remaining (1),
+        predator offset/rel vel (4), shared health (1). Cooldown is
         not observed: variant F added it (obs_dim 32 -> 33) and lost C's
         basin. Agents already see predator pos/vel.
         """

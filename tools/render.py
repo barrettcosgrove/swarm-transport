@@ -488,7 +488,7 @@ def compute_arena_limit(config, margin=1.15):
     """
     View bounds derived from the walls themselves, rather than a separate
     hardcoded constant that could drift out of sync with the actual arena
-    size as it gets tuned during Phase 2 calibration.
+    size as the walls are retuned.
 
     Measured to each wall's INNER face, not its outer extent, so the framing
     tracks the playable area rather than how thick the walls happen to be.

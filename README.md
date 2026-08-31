@@ -46,7 +46,7 @@ Constraint chain (asserted by tests): clock 90 < full drain 150 < capture 250 < 
 
 ### Physics
 
-Semi-implicit Euler. Penalty (spring) forces, no rotation. Wall stiffness 1200, body 200, payload 250. Agent speed cap 20; predator 3.5 (1.75 on cooldown). Walls are 1.5 thick (midline at 10.0) so a one-step rebound cannot tunnel a body past the outer face.
+Semi-implicit Euler. Penalty (spring) forces, no rotation. Wall stiffness 1200, body 200, payload 250. Agent speed cap 20; predator 3.5 (1.75 on cooldown). Walls are half-thickness 1.5 / 3.0 thick (midline at 10.0) so a one-step rebound cannot tunnel a body past the outer face.
 
 ### Environment
 
@@ -86,7 +86,7 @@ Per-iteration JSON. Train and eval share the same helpers.
 
 | Script | Role |
 |---|---|
-| `tools/evaluate.py` | Win/capture/timeout + damage histogram + the metrics above |
+| `tools/evaluate.py` | Win/capture/timeout + the metrics above |
 | `tools/calibrate.py` | Payload cruise speed → recommended `max_steps` |
 | `tools/threat_probe.py` | Evasion cosine and pre-capture distance |
 | `tools/threat_calibrate.py` | Size threat/camp coefs against the time penalty |

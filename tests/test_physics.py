@@ -259,10 +259,10 @@ def test_sustained_thrust_at_the_real_constants_cannot_cross_a_wall():
     midline, not on the face: penetration into a wall is normal for a
     penalty-force system, crossing its center is terminal.
 
-    Measured reach is 8.97, which the current midline at 10.0 clears
-    comfortably. Against the 1.0 thick walls this replaced, whose midline sat
-    at 9.0, plain thrust and nothing else came within 0.03 of that same
-    threshold -- the old geometry had no margin at all.
+    The current midline at 10.0 is the containment guarantee. Against the
+    1.0 thick walls this replaced, whose midline sat at 9.0, plain thrust
+    and nothing else came within 0.03 of that same threshold -- the old
+    geometry had no margin at all.
     """
     config = Config()
     world = make_arena_world(config, EIGHT_DIRECTIONS)
@@ -293,8 +293,9 @@ def test_sustained_thrust_at_the_real_constants_cannot_cross_a_wall():
 def test_the_cap_contains_an_agent_that_is_already_moving_too_fast(agent_max_speed, contained):
     """The case the cap is actually for.
 
-    Thrust alone tops out at 18.8 in the test above and never threatens the
-    wall, so that run would pass with or without a cap. What the cap defends
+    Thrust alone saturates at agent_max_speed (thrust/drag = 20) in the test
+    above and never threatens the wall, so that run would pass with or
+    without a cap. What the cap defends
     against is a body arriving at the wall carrying a speed that no thrust
     produced -- an agent squeezed between the payload and a wall, or bounced
     off one. Rollouts before this fix measured 59 units/s that way, so the

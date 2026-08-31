@@ -117,8 +117,7 @@ def test_one_iteration_produces_the_expected_shapes():
 
 
 def test_actor_never_sees_more_than_its_own_observation():
-    """A hard deployment constraint, not a preference: each agent runs its own
-    ONNX model in the browser with local perception only. The actor's input
+    """The actor is local-only; the critic is centralized. The actor's input
     width must be obs_dim, so handing it a joint state has to fail."""
     config = Config()
     actor = Actor(config.obs_dim, ACTION_DIM, config.hidden_dim)
@@ -135,8 +134,8 @@ def test_actor_never_sees_more_than_its_own_observation():
 
 
 def test_actor_forward_is_the_mean_only():
-    """forward has to stay traceable as obs -> mean for torch.onnx.export, so
-    it must be deterministic and must not consume log_std."""
+    """forward is the deterministic mean: render and eval call it directly,
+    and it must not consume log_std."""
     config = Config()
     actor = Actor(config.obs_dim, ACTION_DIM, config.hidden_dim)
     obs = torch.randn(3, config.n_agents, config.obs_dim)
@@ -340,11 +339,13 @@ def test_clear_wipes_stale_truncation_bootstraps():
 
 def test_checkpoint_round_trip_restores_every_tensor():
     """Including log_std and agent_ids, which are only carried because one is a
-    registered Parameter and the other a registered buffer."""
+    registered Parameter and the other a registered buffer. trainer.load also
+    picks the JSON history back up."""
     from train.checkpoints import load_checkpoint
 
     config = make_test_config()
     trainer = MAPPOTrainer(config)
+    trainer.logger.history = [{"iteration": 7, "note": "marker"}]
 
     # move every parameter off its initial value so a no-op load cannot pass
     with torch.no_grad():
@@ -374,11 +375,15 @@ def test_checkpoint_round_trip_restores_every_tensor():
     obs = torch.randn(2, config.n_agents, config.obs_dim)
     assert torch.equal(trainer.actor(obs), fresh_actor(obs))
 
+    resumed = MAPPOTrainer(config)
+    assert resumed.load(path) == 7
+    assert resumed.logger.history == [{"iteration": 7, "note": "marker"}]
+
     os.remove(path)
 
 
 def test_checkpoint_loads_without_optimizers():
-    """export_onnx.py and render.py want weights only, and must not have to
+    """render.py and evaluate.py want weights only, and must not have to
     build optimizers to get them."""
     from train.checkpoints import load_checkpoint
 

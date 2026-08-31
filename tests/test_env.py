@@ -10,7 +10,6 @@ Run with: pytest tests/test_env.py -v
 import dataclasses
 import math
 import torch
-import pytest
 
 from env.env import Env
 from env.world import WorldState
@@ -361,7 +360,7 @@ def test_health_loss_blame_falls_on_the_agent_in_range():
     config = dataclasses.replace(
         make_test_config(num_envs=1, n_agents=3),
         progress_coef=0.0, time_penalty_coef=0.0, success_reward=0.0,
-        approach_coef_start=0.0, alignment_coef_start=0.0,
+        approach_coef_start=0.0,
         captured_reward=0.0, collision_coef=0.0, threat_coef=0.0,
         push_coef=0.0, camp_coef=0.0,
         health_loss_coef=1.0, health_loss_blame_fraction=0.7,
@@ -413,7 +412,7 @@ def test_progress_blame_falls_on_agents_in_the_push_zone():
     config = dataclasses.replace(
         make_test_config(num_envs=1, n_agents=3),
         progress_coef=50.0, time_penalty_coef=0.0, success_reward=0.0,
-        approach_coef_start=0.0, alignment_coef_start=0.0,
+        approach_coef_start=0.0,
         captured_reward=0.0, collision_coef=0.0, threat_coef=0.0,
         push_coef=0.0, health_loss_coef=0.0, camp_coef=0.0,
         progress_blame_fraction=0.7, push_zone_radius=0.5,
@@ -469,7 +468,7 @@ def test_threat_term_is_zero_outside_the_danger_radius_and_private():
     config = dataclasses.replace(
         make_test_config(num_envs=1, n_agents=2),
         progress_coef=0.0, time_penalty_coef=0.0, success_reward=0.0,
-        approach_coef_start=0.0, alignment_coef_start=0.0,
+        approach_coef_start=0.0,
         health_loss_coef=0.0, captured_reward=0.0, collision_coef=0.0,
         threat_coef=0.3, predator_danger_radius=1.0, push_coef=0.0,
         predator_max_speed=3.5, camp_coef=0.0,
@@ -1075,7 +1074,7 @@ def test_camp_term_is_always_on_inside_its_radius_and_private():
     config = dataclasses.replace(
         make_test_config(num_envs=1, n_agents=2),
         progress_coef=0.0, time_penalty_coef=0.0, success_reward=0.0,
-        approach_coef_start=0.0, alignment_coef_start=0.0,
+        approach_coef_start=0.0,
         health_loss_coef=0.0, captured_reward=0.0, collision_coef=0.0,
         threat_coef=0.0, push_coef=0.0,
         camp_coef=0.4, predator_camp_radius=0.8,

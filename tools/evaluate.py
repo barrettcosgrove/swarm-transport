@@ -8,12 +8,6 @@ A win rate alone cannot distinguish "agents are dying" from "agents are slow"
 from "agents wander" -- those three call for completely different fixes, and
 splitting losses into captures and timeouts separates them in one number.
 
-The damage histogram is the other half, and it is what retired the original
-force-proportional damage model: scaling that coefficient moved the whole
-distribution but left its shape alone, so the p95 stayed near 3x the median at
-every scale. A flat drain reads as a tail ratio of 1.0, which is the quickest
-confirmation that health has become a predictable budget rather than a lottery.
-
 Behavioural fields (position_ratio, push_efficiency, payload progress, predator
 distance) use the same helpers as train/mappo.py so a periodic eval and an
 iteration record cannot disagree on the metrics that gate the next change.
@@ -44,10 +38,6 @@ class EvalResult:
     mean_win_steps: float
     mean_capture_steps: float
     mean_timeout_steps: float
-    damage_events: int
-    damage_median: float
-    damage_p95: float
-    damage_max: float
     mean_end_health: float
     position_ratio: float
     push_efficiency: float
@@ -62,14 +52,6 @@ class EvalResult:
     other_evade_cosine: float
     other_thrust: float
     closing_thrust: float
-
-    @property
-    def damage_tail_ratio(self) -> float:
-        """p95 / median. Near 1.0 means every hit costs about the same; large
-        means a handful of hits do the real damage."""
-        if self.damage_median <= 0.0:
-            return float("nan")
-        return self.damage_p95 / self.damage_median
 
     def as_log(self):
         """Flat dict for the training JSON, prefixed so it cannot collide with
@@ -128,7 +110,6 @@ def evaluate(config, policy, seeds=(0, 1, 2), n_steps=None):
     n_steps = n_steps or 2 * config.max_steps
     wins = captures = timeouts = 0
     win_lengths, capture_lengths, timeout_lengths = [], [], []
-    damage = []
     end_health = []
     payload_progress = []
     behind = front = 0
@@ -150,7 +131,6 @@ def evaluate(config, policy, seeds=(0, 1, 2), n_steps=None):
 
         for _ in range(n_steps):
             world_state, scenario_state = env.world_state, env.scenario_state
-            health_before = scenario_state.health.clone()
 
             actions = policy(world_state, scenario_state, cfg)
             stats = scenario.evasion_step_stats(
@@ -195,11 +175,7 @@ def evaluate(config, policy, seeds=(0, 1, 2), n_steps=None):
                     start_dist,
                 )
 
-            lost = health_before - ss.health
-            damage += lost[lost > 0].tolist()
-
     episodes = wins + captures + timeouts
-    d = torch.tensor(damage) if damage else torch.zeros(1)
 
     return EvalResult(
         wins=wins,
@@ -213,10 +189,6 @@ def evaluate(config, policy, seeds=(0, 1, 2), n_steps=None):
         mean_win_steps=_mean(win_lengths),
         mean_capture_steps=_mean(capture_lengths),
         mean_timeout_steps=_mean(timeout_lengths),
-        damage_events=len(damage),
-        damage_median=float(d.median()),
-        damage_p95=float(d.quantile(0.95)),
-        damage_max=float(d.max()),
         mean_end_health=_mean(end_health),
         position_ratio=behind / max(front, 1),
         push_efficiency=force_goal / force_mag if force_mag else 0.0,

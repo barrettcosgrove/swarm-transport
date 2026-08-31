@@ -147,7 +147,6 @@ def step(world_state, agent_actions, predator_actions, dt, agent_max_thrust, pre
     #payload-obstacle forces
     force_payload_obstacle = box_box_forces(world_state.payload_pos, world_state.payload_halfsize, world_state.obstacle_center, world_state.obstacle_halfsize, obstacle_stiffness)
     
-    #Need to refactor this 
     agent_total_force = agent_thrust + agent_drag + force_agent_agent + force_agent_from_predator + force_agent_from_payload + force_agent_wall + force_agent_obstacle
     predator_total_force = predator_thrust + predator_drag + force_predator_from_agent + force_predator_from_payload + force_predator_wall + force_predator_obstacle
     payload_total_force = payload_drag + force_payload_from_agent + force_payload_from_predator + force_payload_wall + force_payload_obstacle
