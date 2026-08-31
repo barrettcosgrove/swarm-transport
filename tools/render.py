@@ -961,6 +961,11 @@ def _write_video(output_path, images, fps):
         imageio.mimsave(
             output_path, images, fps=fps, codec="libx264",
             pixelformat="yuv420p", macro_block_size=1, quality=8)
+        # GitHub and most markdown previews strip <video> unless the src is
+        # a drag-and-drop user-attachments URL. A GIF sibling is what the
+        # README can actually display.
+        gif_path = os.path.splitext(output_path)[0] + ".gif"
+        imageio.mimsave(gif_path, images, fps=min(int(fps), 12), loop=0)
     else:
         # loop=0 writes the Netscape 2.0 extension (infinite loop). Without it
         # GitHub and most markdown previews show the GIF as a still first frame.

@@ -8,13 +8,9 @@ A custom vectorized multi-agent simulator in PyTorch. Five agents, trained with 
 
 ![Trained policy](outputs/actor_variant_c_400_seed_4_demo.gif)
 
-[MP4](outputs/actor_variant_c_400_seed_4_demo.mp4)
-
 **Scripted policy** — hand-written approach → push → evade controller. Same 32-dim local observation as the actor. Solvability check and benchmark, not a learned policy.
 
 ![Scripted policy](outputs/scripted_demo.gif)
-
-[MP4](outputs/scripted_demo.mp4)
 
 `python -m tools.evaluate` scores both policies on the same metrics. Control died about as often as it won; seed 4 cut capture by ~3× and learned who stands behind the crate.
 
@@ -66,7 +62,7 @@ Every 25 iterations: `checkpoint_latest.pt`. Every 100: a numbered snapshot. Per
 
 ### Rendering
 
-`tools/render.py` records the episode, then draws it (matplotlib + imageio). Dark arena, drop shadows, numbered agents, velocity ticks, predator lock-on and cooldown, push-zone tint, solid goal ring, health bar. Demo GIFs pick the 6 cleanest wins from 100 episodes. `python -m tools.render` also writes MP4s.
+`tools/render.py` records the episode, then draws it (matplotlib + imageio). Dark arena, drop shadows, numbered agents, velocity ticks, predator lock-on and cooldown, push-zone tint, solid goal ring, health bar. Demo GIFs pick the 6 cleanest wins from 100 episodes.
 
 ### Logging
 
